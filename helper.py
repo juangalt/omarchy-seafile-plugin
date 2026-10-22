@@ -736,10 +736,10 @@ def build_status() -> dict:
         ts = int(last_by_name.get(name) or 0)
         if ts > last_sync_ts:
             last_sync_ts = ts
-        state = str(repo.get("state") or "")
+        repo_state = str(repo.get("state") or "")
         raw_err = str(repo.get("error") or "")
-        err = "" if state == "synchronized" else enrich_unknown_error(rid, name, raw_err)
-        entry = _repo_entry(rid, name, state, path, ts, err)
+        err = "" if repo_state == "synchronized" else enrich_unknown_error(rid, name, raw_err)
+        entry = _repo_entry(rid, name, repo_state, path, ts, err)
         if "progress" in repo:
             entry["progress"] = repo.get("progress")
         repos.append(entry)
