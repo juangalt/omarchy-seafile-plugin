@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "juangalt.seafile",
+  "name": "Seafile",
+  "version": "0.1.0",
+  "author": "juangalt",
+  "license": "MIT",
+  "description": "Seafile sync status, pause/snooze, and setup for seaf-cli in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Seafile",
+    "description": "Watch Seafile libraries, sync now, pause or snooze, and open your synced folder.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}
