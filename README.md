@@ -9,12 +9,27 @@ It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze
 ## Install
 
 ```bash
+omarchy plugin add https://github.com/juangalt/omarchy-seafile-plugin.git --enable
+```
+
+SSH also works if you prefer keys over HTTPS:
+
+```bash
 omarchy plugin add git@github.com:juangalt/omarchy-seafile-plugin.git --enable
 ```
 
-Use the **SSH** URL — `omarchy plugin add` disables interactive HTTPS prompts.
+Requires the [`seafile`](https://archlinux.org/packages/extra/x86_64/seafile/) package (`seaf-cli`). The panel can install it with `yay` if it is missing.
 
-Requires the `seafile` package (`seaf-cli`). The panel can install it with `yay` if it is missing.
+---
+
+## Remove
+
+```bash
+omarchy plugin disable juangalt.seafile
+omarchy plugin remove juangalt.seafile
+```
+
+Removal deletes the plugin checkout. It does not uninstall the `seafile` package or erase `~/.seafile-client` library data.
 
 ---
 

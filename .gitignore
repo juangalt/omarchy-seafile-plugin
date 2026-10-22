@@ -5,3 +5,6 @@ __pycache__/
 .state.json
 .idea/
 .vscode/
+
+# Local preview research (not for shipping)
+docs/preview-research/
