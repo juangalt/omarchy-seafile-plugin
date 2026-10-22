@@ -1,8 +1,10 @@
 # Seafile for Omarchy
 
-Bar widget for [Seafile](https://www.seafile.com/) / `seaf-cli` on [Omarchy](https://omarchy.org/).
+A bar widget for [Seafile](https://www.seafile.com/) on [Omarchy](https://omarchy.org/).
 
-It sits on top of an existing `seaf-cli` setup: status in the bar, sync now, pause/snooze, open folder, logs, and a terminal wizard to install or repair a library binding.
+It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze, open the library folder, view logs, and a terminal wizard to connect or repair a library binding.
+
+---
 
 ## Install
 
@@ -10,41 +12,83 @@ It sits on top of an existing `seaf-cli` setup: status in the bar, sync now, pau
 omarchy plugin add git@github.com:juangalt/omarchy-seafile-plugin.git --enable
 ```
 
-Use the SSH URL (`omarchy plugin add` disables interactive HTTPS prompts).
+Use the **SSH** URL — `omarchy plugin add` disables interactive HTTPS prompts.
 
-Needs the `seafile` package (provides `seaf-cli`). The panel can install it with `yay` if it is missing.
+Requires the `seafile` package (`seaf-cli`). The panel can install it with `yay` if it is missing.
+
+---
 
 ## Use
 
-| Action | What it does |
+| Input | Action |
 | --- | --- |
-| Left-click icon | Open the panel |
+| Left-click | Open the panel |
 | Middle-click | Sync now |
 | Right-click | Refresh status |
-| Pause switch | Stops the Seafile daemon (and your user `seaf-daemon.service` if present) |
+| `s` / `p` | Sync now / pause·resume (panel focused) |
+
+| Control | Behavior |
+| --- | --- |
+| Pause | Stops the Seafile daemon (and your user `seaf-daemon.service` if present) |
 | Snooze 15m / 1h | Pause, then auto-resume |
-| Connect / repair | Terminal wizard: re-attach a saved library, or sign in and sync |
+| Connect / repair | Terminal wizard under **More** — re-attach a saved library, or sign in and sync |
 
 Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `https://` if you omit it, and asks before using cleartext HTTP.
 
-The public hostname (for example `https://seafile.zombie.enterprises`) is supported. Cloudflare sometimes blocks Python’s default User-Agent with error **1010**; the setup wizard sends a normal browser User-Agent so that host works like it does for you elsewhere.
+---
+
+## How Connect works
+
+1. Signs in and lists remote libraries.
+2. Ensures a valid **40-character hex** `client_id` (Seafile rejects anything else on download permission-check), kept in sync with `~/.seafile-client/seafile-data/id`.
+3. Queues `seaf-cli sync` / `download`, clears stuck clone tasks if needed.
+4. **Waits until the library actually appears locally** before declaring success — `seaf-cli` alone only queues the clone.
+
+Setup log (mode `600`):
+
+`~/.local/state/omarchy/plugins/juangalt.seafile/setup.log`
+
+Passwords are not written there; account email and server URL may be.
+
+---
+
+## Cloudflare and public hosts
+
+Hosts behind Cloudflare (for example `https://seafile.zombie.enterprises`) sometimes block Python’s default User-Agent with error **1010**.
+
+The Connect wizard runs `seaf-cli` through a small wrapper that sends a normal browser User-Agent for API calls (login, list-remote, download-info). The daemon’s own file transfer uses Seafile’s native client headers — that path does not need the wrapper.
+
+---
 
 ## Important
 
 - **One Seafile client.** Do not run `seafile-client` (GUI) alongside this. Both use the same data directory and will fight.
-- **Pause stops the whole daemon**, not a single library. If you manage sync with `systemctl --user seaf-daemon.service`, the plugin stops that unit too.
-- **Setup log:** `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log` (mode `600`). Passwords are not written there; account email and server URL may be.
+- **Pause stops the whole daemon**, not a single library.
+- Prefer a full URL with scheme. LAN HTTP is allowed after an explicit confirm.
+
+---
 
 ## Development
 
 ```bash
 git clone git@github.com:juangalt/omarchy-seafile-plugin.git
+cd omarchy-seafile-plugin
 # edit, then:
 omarchy plugin update juangalt.seafile
 # or symlink the clone into ~/.config/omarchy/plugins/juangalt.seafile
 ```
 
-Validate: `omarchy plugin validate .`
+Validate:
+
+```bash
+omarchy plugin validate .
+bash -n scripts/setup.sh
+python3 -m py_compile helper.py scripts/seaf_cli_ua.py
+node test/model.test.js
+python3 test/helper_unit.py
+```
+
+---
 
 ## License
 

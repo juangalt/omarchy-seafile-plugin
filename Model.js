@@ -52,6 +52,7 @@ function fileUrlToPath(url) {
   }
   if (value.indexOf("\0") !== -1 || value.indexOf("\n") !== -1 || value.indexOf("\r") !== -1)
     return ""
+  if (value.charAt(0) !== "/") return ""
   while (value.length > 1 && value.charAt(value.length - 1) === "/")
     value = value.substring(0, value.length - 1)
   return value
@@ -115,9 +116,12 @@ function heroMeta(status, tr, fmt) {
     var left = minutesLeft(status.snoozeUntil, undefined, f)
     var label = clip(status.snoozeLabel, 40)
     if (left !== "") {
-      if (label !== "")
-        return t("meta.snoozeLabelLeft", "%1 · %2m left").replace("%2", left).replace("%1", label)
-      return t("meta.minutesLeft", "%1m left").replace("%1", left)
+      if (label !== "") {
+        return t("meta.snoozeLabelLeft", "%1 · %2m left")
+          .split("%1").join(label)
+          .split("%2").join(left)
+      }
+      return t("meta.minutesLeft", "%1m left").split("%1").join(left)
     }
     return label || t("meta.snoozed", "Snoozed")
   }

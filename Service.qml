@@ -41,7 +41,7 @@ Item {
   }
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
-  readonly property bool busy: statusProcess.running || controlProcess.running
+  readonly property bool busy: helperBusy
   readonly property string pluginPath: Model.fileUrlToPath(pluginDir)
   readonly property bool pluginPathAbsolute: pluginPath.length > 0 && pluginPath.charAt(0) === "/"
   readonly property string helperPath: pluginPathAbsolute ? (pluginPath + "/helper.py") : ""
@@ -53,6 +53,10 @@ Item {
   property string _statusOutput: ""
   property string _controlOutput: ""
   property string _controlError: ""
+  // Set before spawning control so a timer refresh cannot sneak in between
+  // the busy check and controlProcess.running = true.
+  property bool _controlClaimed: false
+  readonly property bool helperBusy: statusProcess.running || controlProcess.running || _controlClaimed
 
   Commons.Translations {
     id: strings
@@ -84,11 +88,16 @@ Item {
   function refresh() {
     // Never overlap status with control: status while snoozed can stop_daemon()
     // and race sync-now/resume that just started the daemon.
-    if (statusProcess.running || controlProcess.running || !helperReady) return
+    if (helperBusy || !helperReady) return
     _statusOutput = ""
     refreshing = true
     statusProcess.command = ["python3", helperPath, "status"]
     statusProcess.running = true
+  }
+
+  function noteBusy() {
+    actionStatus = tr("action.busy", "Busy…")
+    actionStatusTimer.restart()
   }
 
   function applyStatus(raw) {
@@ -118,33 +127,41 @@ Item {
   }
 
   function runHelper(args, desired) {
-    if (!helperReady || controlProcess.running) return
+    if (!helperReady || helperBusy) return false
+    _controlClaimed = true
     if (desired !== undefined) _desired = desired
     _controlOutput = ""
     _controlError = ""
     controlProcess.command = ["python3", helperPath].concat(args)
     controlProcess.running = true
+    return true
   }
 
   function pause() { runHelper(["pause"], 0) }
   function resume() { runHelper(["resume"], 1) }
 
   function toggleRunning() {
-    if (!installed || busy || !helperReady) return
+    if (!installed || !helperReady) return
+    if (busy) { noteBusy(); return }
     if (active) pause()
     else resume()
   }
 
   function syncNow() {
-    if (!installed || busy || !helperReady) return
+    if (!installed || !helperReady) return
+    if (busy) { noteBusy(); return }
     actionStatusTimer.stop()
     _pendingSync = true
     actionStatus = tr("action.syncing", "Syncing…")
-    runHelper(["sync-now"], 1)
+    if (!runHelper(["sync-now"], 1)) {
+      _pendingSync = false
+      noteBusy()
+    }
   }
 
   function snooze(seconds, label) {
-    if (!installed || busy || !helperReady) return
+    if (!installed || !helperReady) return
+    if (busy) { noteBusy(); return }
     actionStatus = tr("action.snoozed", "Snoozed")
     actionStatusTimer.restart()
     runHelper(["snooze", String(seconds), String(label)], 0)
@@ -187,9 +204,13 @@ Item {
   function openLogs() {
     var path = String(logPath || "")
     if (path.charAt(0) !== "/") return
+    var quoted = shellQuote(path)
     Quickshell.execDetached([
       "omarchy-launch-floating-terminal-with-presentation",
-      "less +G " + shellQuote(path)
+      "bash -lc " + shellQuote(
+        "if [ -f " + quoted + " ]; then less +G " + quoted + "; "
+        + "else echo 'No Seafile log yet.'; echo " + quoted + "; read -n1 -s; fi"
+      )
     ])
   }
 
@@ -198,7 +219,8 @@ Item {
     interval: root.refreshIntervalSec * 1000
     repeat: true
     running: root.helperReady
-    triggeredOnStart: true
+    // First hit comes from startupRamp to avoid a double status probe at launch.
+    triggeredOnStart: false
     onTriggered: root.refresh()
   }
 
@@ -208,10 +230,11 @@ Item {
     interval: 2000
     repeat: true
     running: root.helperReady
+    triggeredOnStart: true
     onTriggered: {
       ticks += 1
+      root.refresh()
       if ((root.running && root.configured) || ticks >= 15) startupRamp.running = false
-      else root.refresh()
     }
   }
 
@@ -303,12 +326,15 @@ Item {
       onStreamFinished: root._controlError = text
     }
     onExited: function(exitCode) {
+      root._controlClaimed = false
       var stdout = String(controlStdout.text || root._controlOutput || "")
       var stderr = String(controlStderr.text || root._controlError || "")
       var message = ""
       var parsedOk = false
+      var syncPayload = null
       try {
-        message = Model.controlMessage(JSON.parse(stdout))
+        syncPayload = JSON.parse(stdout)
+        message = Model.controlMessage(syncPayload)
         parsedOk = true
       } catch (e) {
         message = String(stderr || stdout || "").trim()
@@ -326,18 +352,14 @@ Item {
       } else {
         root.lastError = ""
         if (wasSync) {
-          var synced = 0
-          try {
-            var syncPayload = JSON.parse(stdout)
-            synced = Number(syncPayload.synced || 0)
-          } catch (e) {
-            synced = -1
-          }
+          var synced = syncPayload ? Number(syncPayload.synced || 0) : -1
           if (synced === 0) {
             root.actionStatus = root.tr("action.nothingToSync", "No libraries to sync")
             root.actionStatusTimer.restart()
           } else {
-            root.actionStatus = ""
+            // RPC accepted — keep a soft status until settle refreshes catch up.
+            root.actionStatus = root.tr("action.syncRequested", "Sync requested…")
+            root.actionStatusTimer.restart()
           }
         }
       }

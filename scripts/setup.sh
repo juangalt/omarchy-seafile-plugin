@@ -244,45 +244,69 @@ explain_seaf_error() {
   echo "Seafile command failed. See the log for the full output."
 }
 
-# seaf-daemon sends client_id on every download permission-check. The server
-# requires exactly 40 hex chars (same as the device id in seafile-data/id).
-# Empty or wrong-length ids return HTTP 400 ("Unknown error" in status).
-ensure_client_id() {
-  local current cid cname need_set=0
-  current=$("${SEAF[@]}" config -k client_id 2>/dev/null | sed -n 's/^client_id = //p' | tr -d '[:space:]')
-  if [[ -z $current || ${#current} -ne 40 || ! $current =~ ^[0-9a-fA-F]{40}$ ]]; then
-    need_set=1
-  fi
-  if [[ -f ${DATA_DIR}/id ]]; then
-    cid=$(tr -d '[:space:]' <"${DATA_DIR}/id")
-  fi
-  if [[ -z ${cid:-} || ${#cid} -ne 40 || ! $cid =~ ^[0-9a-fA-F]{40}$ ]]; then
-    cid=$(python3 -c 'import secrets; print(secrets.token_hex(20))')
-    mkdir -p "$DATA_DIR"
-    printf '%s\n' "$cid" >"${DATA_DIR}/id"
-    chmod 600 "${DATA_DIR}/id" 2>/dev/null || true
-  fi
-  if ((need_set == 0)) && [[ $current == "$cid" ]]; then
-    return 0
-  fi
-  if ((need_set == 0)); then
-    # Config already valid; keep it even if id file differs.
-    return 0
-  fi
-  log "client_id invalid (was '${current:-empty}', len=${#current}) — setting 40-char id and restarting daemon"
-  echo "Fixing Seafile client id (server requires 40 hex characters)…"
-  "${SEAF[@]}" config -k client_id -v "$cid" >/dev/null 2>&1 || true
-  cname=$("${SEAF[@]}" config -k client_name 2>/dev/null | sed -n 's/^client_name = //p' | tr -d '[:space:]')
-  if [[ -z $cname ]]; then
-    "${SEAF[@]}" config -k client_name -v "$(hostname -s 2>/dev/null || echo seafile)" >/dev/null 2>&1 || true
-  fi
+_valid_client_id() {
+  [[ -n ${1:-} && ${#1} -eq 40 && $1 =~ ^[0-9a-fA-F]{40}$ ]]
+}
+
+wait_for_daemon_sock() {
+  local deadline=$((SECONDS + 15))
+  while ((SECONDS < deadline)); do
+    [[ -S ${DATA_DIR}/seafile.sock ]] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+restart_seafile_daemon() {
   if systemctl --user is-enabled seaf-daemon.service >/dev/null 2>&1; then
     systemctl --user restart seaf-daemon.service >/dev/null 2>&1 || true
   else
     "${SEAF[@]}" stop >/dev/null 2>&1 || true
     "${SEAF[@]}" start >/dev/null 2>&1 || true
   fi
-  sleep 1
+  wait_for_daemon_sock || log "Warning: seafile.sock not up after daemon restart"
+}
+
+# seaf-daemon sends client_id on every download permission-check. The server
+# requires exactly 40 hex chars. Auth login uses seafile-data/id as device_id —
+# keep config client_id and that file identical.
+ensure_client_id() {
+  local current file_id chosen cname
+  current=$("${SEAF[@]}" config -k client_id 2>/dev/null | sed -n 's/^client_id = //p' | tr -d '[:space:]')
+  file_id=""
+  if [[ -f ${DATA_DIR}/id ]]; then
+    file_id=$(tr -d '[:space:]' <"${DATA_DIR}/id")
+  fi
+
+  if _valid_client_id "$current"; then
+    chosen=$current
+  elif _valid_client_id "$file_id"; then
+    chosen=$file_id
+  else
+    chosen=$(python3 -c 'import secrets; print(secrets.token_hex(20))')
+  fi
+
+  mkdir -p "$DATA_DIR"
+  if [[ $file_id != "$chosen" ]]; then
+    printf '%s\n' "$chosen" >"${DATA_DIR}/id"
+    chmod 600 "${DATA_DIR}/id" 2>/dev/null || true
+    log "Wrote seafile-data/id to match client_id ${chosen:0:8}…"
+  fi
+
+  if [[ $current == "$chosen" ]]; then
+    return 0
+  fi
+
+  log "Aligning client_id to ${chosen:0:8}… (was '${current:-empty}', len=${#current})"
+  echo "Aligning Seafile client id (must be 40 hex characters)…"
+  if ! "${SEAF[@]}" config -k client_id -v "$chosen" >/dev/null 2>&1; then
+    fail "Could not set Seafile client_id. Is the daemon running?"
+  fi
+  cname=$("${SEAF[@]}" config -k client_name 2>/dev/null | sed -n 's/^client_name = //p' | tr -d '[:space:]')
+  if [[ -z $cname ]]; then
+    "${SEAF[@]}" config -k client_name -v "$(hostname -s 2>/dev/null || echo seafile)" >/dev/null 2>&1 || true
+  fi
+  restart_seafile_daemon
 }
 
 # seaf-cli sync/download return as soon as the clone task is queued. Wait until
@@ -419,13 +443,7 @@ PY
   local rc=$?
   if ((rc == 2)); then
     log "Restarting seafile daemon to clear stuck clone task for $repo_id"
-    if systemctl --user is-enabled seaf-daemon.service >/dev/null 2>&1; then
-      systemctl --user restart seaf-daemon.service >/dev/null 2>&1 || true
-    else
-      "${SEAF[@]}" stop >/dev/null 2>&1 || true
-      "${SEAF[@]}" start >/dev/null 2>&1 || true
-    fi
-    sleep 1
+    restart_seafile_daemon
   fi
 }
 
@@ -676,7 +694,8 @@ PY
   [[ -n $AUTH_TOKEN ]] || fail "Login returned an empty token."
 }
 
-read_existing_binding() {
+# Prints one pipe-separated binding per line (id|email|server|worktree|token).
+read_existing_bindings() {
   [[ -f $REPO_DB ]] || return 0
   command -v sqlite3 >/dev/null 2>&1 || return 0
   sqlite3 "$REPO_DB" "
@@ -687,8 +706,14 @@ read_existing_binding() {
       IFNULL((SELECT value FROM RepoProperty WHERE repo_id=r.repo_id AND key='worktree'), ''),
       IFNULL((SELECT value FROM RepoProperty WHERE repo_id=r.repo_id AND key='token'), '')
     FROM Repo r
-    LIMIT 1;
+    ORDER BY r.repo_id;
   " 2>/dev/null || true
+}
+
+# Sets existing_* globals from a pipe-separated binding row.
+load_binding_row() {
+  local row=$1
+  IFS='|' read -r existing_id existing_email existing_server existing_worktree existing_token <<<"$row"
 }
 
 accept_server_url() {
@@ -722,7 +747,7 @@ prompt_login() {
   [[ -n $password ]] || fail "Password required."
 
   tfa=""
-  if gum confirm "This account uses two-factor authentication (2FA)?"; then
+  if gum confirm --default=No "This account uses two-factor authentication (2FA)?"; then
     tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
     [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
   fi
@@ -750,7 +775,7 @@ fi
 if ! "${SEAF[@]}" status >/dev/null 2>&1; then
   echo "Starting seafile daemon…"
   run_seaf "Start daemon" "${SEAF[@]}" start >/dev/null
-  sleep 1
+  wait_for_daemon_sock || fail "Seafile daemon did not create seafile.sock."
 fi
 
 ensure_client_id
@@ -766,16 +791,33 @@ if "${SEAF[@]}" list 2>/dev/null | awk 'NR>1{found=1} END{exit !found}'; then
   fi
 fi
 
-existing=$(read_existing_binding || true)
 existing_id=""
 existing_email=""
 existing_server=""
 existing_worktree=""
 existing_token=""
-if [[ -n ${existing:-} ]]; then
-  IFS='|' read -r existing_id existing_email existing_server existing_worktree existing_token <<<"$existing"
+mapfile -t _binding_rows < <(read_existing_bindings || true)
+if ((${#_binding_rows[@]} == 1)); then
+  load_binding_row "${_binding_rows[0]}"
   log "Found leftover binding id=$existing_id email=$existing_email server=$existing_server worktree=$existing_worktree"
+elif ((${#_binding_rows[@]} > 1)); then
+  echo "Found ${#_binding_rows[@]} leftover library bindings."
+  _pick_labels=()
+  for _row in "${_binding_rows[@]}"; do
+    IFS='|' read -r _bid _bemail _bserver _bwt _btok <<<"$_row"
+    _pick_labels+=("${_bwt:-?}  (${_bid:0:8}… · ${_bemail:-no-email})")
+  done
+  _picked=$(printf '%s\n' "${_pick_labels[@]}" | gum choose --header "Which binding should Connect repair?")
+  [[ -n ${_picked:-} ]] || fail "No binding selected."
+  for i in "${!_pick_labels[@]}"; do
+    if [[ ${_pick_labels[$i]} == "$_picked" ]]; then
+      load_binding_row "${_binding_rows[$i]}"
+      break
+    fi
+  done
+  log "Selected leftover binding id=$existing_id email=$existing_email server=$existing_server worktree=$existing_worktree"
 fi
+unset _binding_rows _pick_labels _picked _row _bid _bemail _bserver _bwt _btok i
 
 server=""
 username=""
@@ -847,7 +889,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
     password=$(gum input --password --placeholder "password" --prompt "Password> ")
     [[ -n $password ]] || fail "Password required."
     tfa=""
-    if gum confirm "This account uses two-factor authentication (2FA)?"; then
+    if gum confirm --default=No "This account uses two-factor authentication (2FA)?"; then
       tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
       [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
     fi

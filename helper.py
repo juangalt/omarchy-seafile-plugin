@@ -28,7 +28,7 @@ SYNC_LINE = re.compile(
 )
 TS_LINE = re.compile(r"^\[(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\]")
 _NAME_KEYS = ("sync-worktree-name", "origin-repo-name", "repo-name", "name")
-_REVIVE_STATES = {"active", "activating", "reloading", "deactivating", "failed"}
+_REVIVE_STATES = {"active", "activating", "reloading", "deactivating"}
 
 
 def emit(payload: dict) -> None:
@@ -179,6 +179,7 @@ def unit_may_revive(snap: dict[str, str] | None = None) -> bool:
         return True
     if info.get("SubState") in {"auto-restart", "running", "start", "start-pre"}:
         return True
+    # ActiveState=failed alone is not a revive: Restart=no units stay failed.
     return info.get("ActiveState") in _REVIVE_STATES
 
 
@@ -432,7 +433,11 @@ def _read_seafile_log_tail(limit_bytes: int = 200_000) -> str:
 
 
 def last_sync_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
-    """Map repo name -> unix timestamp of last transition to synchronized."""
+    """Map repo name -> unix timestamp of last transition to synchronized.
+
+    Seafile's log line only includes the library name, so two libraries that
+    share a name will share (and overwrite) the same timestamp.
+    """
     data = _read_seafile_log_tail(limit_bytes)
     if not data:
         return {}
@@ -854,6 +859,18 @@ def cmd_status() -> int:
     return 0
 
 
+def _rpc_sync(client, repo_id: str, timeout: float = 20.0) -> None:
+    """Call seafile RPC sync with a hard timeout so control never hangs forever."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(client.sync, repo_id, "")
+        try:
+            fut.result(timeout=timeout)
+        except FuturesTimeout as exc:
+            raise TimeoutError("seafile sync RPC timed out after %.0fs" % timeout) from exc
+
+
 def cmd_sync_now() -> int:
     if not which_seaf():
         emit({"ok": False, "error": "seaf-cli not installed"})
@@ -889,13 +906,20 @@ def cmd_sync_now() -> int:
         if not rid:
             continue
         try:
-            client.sync(rid, "")
+            _rpc_sync(client, rid)
             synced += 1
         except Exception as exc:  # noqa: BLE001 — surface to UI
             errors.append("%s: %s" % (repo.get("name") or rid, exc))
 
     error_text = "; ".join(errors)
-    emit({"ok": len(errors) == 0, "synced": synced, "errors": errors, "error": error_text})
+    # "synced" means RPC accepted the request, not that transfer finished.
+    emit({
+        "ok": len(errors) == 0,
+        "synced": synced,
+        "requested": synced > 0,
+        "errors": errors,
+        "error": error_text,
+    })
     return 0 if not errors else 1
 
 
