@@ -358,6 +358,7 @@ Item {
         root._desired = -1
         root.lastError = root.elideStatus(message || root.tr("action.failed", "Something went wrong"))
         root.actionStatus = root.lastError
+        root.actionStatusTimer.restart()
       } else {
         root.lastError = ""
         if (wasSync) {
@@ -370,6 +371,8 @@ Item {
             root.actionStatus = root.tr("action.syncRequested", "Sync requested…")
             root.actionStatusTimer.restart()
           }
+        } else {
+          root.actionStatus = ""
         }
       }
       settleTimer.ticks = 0

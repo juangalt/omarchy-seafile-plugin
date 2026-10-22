@@ -775,7 +775,7 @@ if [[ ! -f "${CONF_DIR}/seafile.ini" ]]; then
   run_seaf "Initialize client" "${SEAF[@]}" init -d "$DATA_PARENT" >/dev/null
 fi
 
-if ! "${SEAF[@]}" status >/dev/null 2>&1; then
+if ! timeout 8 "${SEAF[@]}" status >/dev/null 2>&1; then
   echo "Starting seafile daemon…"
   run_seaf "Start daemon" "${SEAF[@]}" start >/dev/null
   wait_for_daemon_sock || fail "Seafile daemon did not create seafile.sock."
@@ -972,11 +972,10 @@ picked=$(printf '%s\n' "${choices[@]}" | gum choose --header "Pick a library to 
 lib_name=${picked%%$'\t'*}
 lib_id=${picked#*$'\t'}
 
-default_folder=${existing_worktree:-}
-if [[ -n $existing_worktree && $lib_id == "$existing_id" ]]; then
+# Only reuse a leftover worktree when the same library id was selected.
+default_folder="${HOME}/$(echo "$lib_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
+if [[ -n $existing_worktree && -n $existing_id && $lib_id == "$existing_id" ]]; then
   default_folder=$existing_worktree
-elif [[ -z $default_folder ]]; then
-  default_folder="${HOME}/$(echo "$lib_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
 fi
 
 folder=$(gum input --value "$default_folder" --prompt "Local folder> ")
