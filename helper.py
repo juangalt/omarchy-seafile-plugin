@@ -292,6 +292,13 @@ def build_status() -> dict:
     elif not configured and not repos:
         aggregate = "setup"
         status_text = "Not configured"
+    elif not repos and sync_errors:
+        # Library was dropped from the client (corrupt/resync) but errors remain.
+        aggregate = "needs-resync"
+        status_text = "Needs re-attach"
+    elif not repos:
+        aggregate = "idle"
+        status_text = "No libraries"
     else:
         aggregate = aggregate_state(repos)
         status_text = {

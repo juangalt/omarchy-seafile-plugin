@@ -68,6 +68,7 @@ function heroMeta(status, strings, fmt) {
   }
   if (!status.installed) return strings.t("meta.notInstalled")
   if (!status.configured) return strings.t("meta.notConfigured")
+  if (status.aggregate === "needs-resync") return strings.t("meta.needsResync")
   if (!status.active) return strings.t("meta.paused")
 
   var parts = []

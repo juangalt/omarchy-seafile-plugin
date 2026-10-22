@@ -22,3 +22,7 @@ Requires the AUR package `seafile` (provides `seaf-cli`). The panel can install 
 ## Notes
 
 Seafile syncs continuously; there is no native “sync every N minutes” setting. Snooze pauses the daemon temporarily.
+
+Setup logs land in `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log`. Server URLs must include `http://` or `https://` — the wizard adds `https://` if you omit the scheme.
+
+Do not run `seafile-client` (GUI) alongside this plugin’s `seaf-cli` daemon; they fight over the same data directory.

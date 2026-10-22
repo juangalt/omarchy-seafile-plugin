@@ -44,15 +44,16 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property bool attention: seafile.aggregate === "error" || seafile.aggregate === "needs-resync"
   readonly property color iconColor: {
     if (!seafile.installed || !seafile.configured) return dim
-    if (seafile.aggregate === "error") return urgent
+    if (root.attention) return urgent
     if (seafile.active) return foreground
     return dim
   }
   readonly property color barIconColor: {
     if (!seafile.installed || !seafile.configured) return Qt.darker(barForeground, 1.55)
-    if (seafile.aggregate === "error") return urgent
+    if (root.attention) return urgent
     if (seafile.active) return barForeground
     return Qt.darker(barForeground, 1.55)
   }
@@ -235,9 +236,9 @@ Panel {
           y: (parent.height - height) / 2
           iconSize: button.iconSize
           color: root.barIconColor
-          warning: seafile.aggregate === "error"
+          warning: root.attention
           badgeColor: root.urgent
-          opacity: seafile.active ? 1.0 : 0.6
+          opacity: seafile.active && !root.attention ? 1.0 : 0.6
         }
       }
     }
@@ -316,7 +317,7 @@ Panel {
                 SeafileIcon {
                   iconSize: Style.font.display
                   color: root.iconColor
-                  warning: seafile.aggregate === "error"
+                  warning: root.attention
                   badgeColor: root.urgent
                 }
               }
