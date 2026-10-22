@@ -82,7 +82,9 @@ Item {
   }
 
   function refresh() {
-    if (statusProcess.running || !helperReady) return
+    // Never overlap status with control: status while snoozed can stop_daemon()
+    // and race sync-now/resume that just started the daemon.
+    if (statusProcess.running || controlProcess.running || !helperReady) return
     _statusOutput = ""
     refreshing = true
     statusProcess.command = ["python3", helperPath, "status"]
@@ -323,7 +325,21 @@ Item {
         root.actionStatus = root.lastError
       } else {
         root.lastError = ""
-        if (wasSync) root.actionStatus = ""
+        if (wasSync) {
+          var synced = 0
+          try {
+            var syncPayload = JSON.parse(stdout)
+            synced = Number(syncPayload.synced || 0)
+          } catch (e) {
+            synced = -1
+          }
+          if (synced === 0) {
+            root.actionStatus = root.tr("action.nothingToSync", "No libraries to sync")
+            root.actionStatusTimer.restart()
+          } else {
+            root.actionStatus = ""
+          }
+        }
       }
       settleTimer.ticks = 0
       settleTimer.restart()

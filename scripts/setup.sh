@@ -182,7 +182,7 @@ is_auth_error() {
 is_encrypted_lib_error() {
   # Library-password hints from seaf-cli (getpass prompt or encrypt errors).
   # Account-password failures are classified by is_auth_error instead.
-  grep -qiE 'password for the library|library password|libpasswd|encrypt' <<<"$1"
+  grep -qiE 'password for the library|library password|libpasswd' <<<"$1"
 }
 
 # Map noisy seaf-cli / urllib failures to one actionable sentence.

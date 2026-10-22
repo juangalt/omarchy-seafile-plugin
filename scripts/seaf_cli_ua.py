@@ -8,6 +8,7 @@ Python-urllib User-Agent. Seafile itself is fine; the edge blocks the client.
 from __future__ import annotations
 
 import runpy
+import shutil
 import sys
 import urllib.request
 
@@ -37,6 +38,11 @@ class Request(_OrigRequest):
 
 urllib.request.Request = Request
 
+seaf_cli = shutil.which("seaf-cli")
+if not seaf_cli:
+    print("seaf-cli not found on PATH", file=sys.stderr)
+    raise SystemExit(127)
+
 # Preserve seaf-cli's expected argv[0] for help text / logging.
 sys.argv = ["seaf-cli", *sys.argv[1:]]
-runpy.run_path("/usr/bin/seaf-cli", run_name="__main__")
+runpy.run_path(seaf_cli, run_name="__main__")

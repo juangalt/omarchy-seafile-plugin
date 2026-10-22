@@ -7,11 +7,13 @@ Commands print a single JSON object on stdout. Log/diagnostic strings stay Engli
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -65,7 +67,20 @@ def load_state() -> dict:
 
 def save_state(data: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    payload = json.dumps(data, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix="state.", suffix=".tmp", dir=str(STATE_DIR))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, STATE_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def seafile_datadir() -> Path | None:
@@ -270,8 +285,12 @@ def start_daemon() -> tuple[bool, str]:
     if snap.get("LoadState") == "loaded":
         code, _out, err = run(["systemctl", "--user", "start", SEAF_UNIT], timeout=20)
         unit_err = (err or "").strip()
-        if code == 0 and _wait_until_up(3.0):
-            return True, ""
+        if code == 0:
+            # Unit accepted start — wait longer before falling back to seaf-cli
+            # start, which can race the unit into "already used by another client".
+            if _wait_until_up(8.0):
+                return True, ""
+            return False, unit_err or "seaf-daemon.service started but seafile.sock did not appear"
     if not which_seaf():
         return False, unit_err or "seaf-cli not installed"
     code, _out, err = run(["seaf-cli", "start"], timeout=15)

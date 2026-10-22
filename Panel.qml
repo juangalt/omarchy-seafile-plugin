@@ -472,7 +472,9 @@ Panel {
             PlainText {
               visible: seafile.repos.length === 0
               width: parent.width
-              text: strings.t("noLibraries")
+              text: seafile.aggregate === "needs-resync"
+                ? strings.t("noLibrariesNeedsResync")
+                : strings.t("noLibraries")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
