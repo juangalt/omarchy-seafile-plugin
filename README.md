@@ -5,8 +5,10 @@ Bar widget for [Seafile](https://www.seafile.com/) / `seaf-cli` on [Omarchy](htt
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/juangalt/omarchy-seafile-plugin.git --enable
+omarchy plugin add git@github.com:juangalt/omarchy-seafile-plugin.git --enable
 ```
+
+(`omarchy plugin add` disables interactive git prompts, so the SSH URL is the reliable option.)
 
 Requires the AUR package `seafile` (provides `seaf-cli`). The panel can install it via `yay` if missing.
 
