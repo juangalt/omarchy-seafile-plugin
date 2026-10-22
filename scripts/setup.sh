@@ -244,25 +244,33 @@ explain_seaf_error() {
   echo "Seafile command failed. See the log for the full output."
 }
 
-# seaf-daemon sends client_id on every download permission-check. An empty
-# value makes the server return HTTP 400 ("Unknown error" in status).
+# seaf-daemon sends client_id on every download permission-check. The server
+# requires exactly 40 hex chars (same as the device id in seafile-data/id).
+# Empty or wrong-length ids return HTTP 400 ("Unknown error" in status).
 ensure_client_id() {
-  local current cid cname
+  local current cid cname need_set=0
   current=$("${SEAF[@]}" config -k client_id 2>/dev/null | sed -n 's/^client_id = //p' | tr -d '[:space:]')
-  if [[ -n $current ]]; then
-    return 0
+  if [[ -z $current || ${#current} -ne 40 || ! $current =~ ^[0-9a-fA-F]{40}$ ]]; then
+    need_set=1
   fi
   if [[ -f ${DATA_DIR}/id ]]; then
     cid=$(tr -d '[:space:]' <"${DATA_DIR}/id")
   fi
-  if [[ -z ${cid:-} ]]; then
-    cid=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+  if [[ -z ${cid:-} || ${#cid} -ne 40 || ! $cid =~ ^[0-9a-fA-F]{40}$ ]]; then
+    cid=$(python3 -c 'import secrets; print(secrets.token_hex(20))')
     mkdir -p "$DATA_DIR"
     printf '%s\n' "$cid" >"${DATA_DIR}/id"
     chmod 600 "${DATA_DIR}/id" 2>/dev/null || true
   fi
-  log "client_id was empty — setting to ${cid:0:8}… and restarting daemon"
-  echo "Fixing empty Seafile client id (required by the server)…"
+  if ((need_set == 0)) && [[ $current == "$cid" ]]; then
+    return 0
+  fi
+  if ((need_set == 0)); then
+    # Config already valid; keep it even if id file differs.
+    return 0
+  fi
+  log "client_id invalid (was '${current:-empty}', len=${#current}) — setting 40-char id and restarting daemon"
+  echo "Fixing Seafile client id (server requires 40 hex characters)…"
   "${SEAF[@]}" config -k client_id -v "$cid" >/dev/null 2>&1 || true
   cname=$("${SEAF[@]}" config -k client_name 2>/dev/null | sed -n 's/^client_name = //p' | tr -d '[:space:]')
   if [[ -z $cname ]]; then
@@ -340,8 +348,17 @@ PY
       line=$(grep -E "${repo_id}|${repo_id:0:8}|permission denied|Bad response code" \
         "${CONF_DIR}/logs/seafile.log" 2>/dev/null | tail -8 || true)
       if grep -qi 'permission denied\|Bad response code.*400' <<<"$line"; then
-        if grep 'client id = ,' "${CONF_DIR}/logs/seafile.log" 2>/dev/null | tail -3 | grep -q 'client id = ,'; then
-          msg="Server rejected the download because this client had an empty client id. Re-run Connect."
+        # Prefer the permission-check URL from this failure (not old log lines).
+        if grep -qoE 'client_id=[0-9a-fA-F]*&' <<<"$line"; then
+          local bad_cid
+          bad_cid=$(grep -oE 'client_id=[0-9a-fA-F]*&' <<<"$line" | tail -1 | sed 's/^client_id=//;s/&$//')
+          if [[ -z $bad_cid ]]; then
+            msg="Server rejected the download (empty client id). Re-run Connect."
+          elif [[ ${#bad_cid} -ne 40 ]]; then
+            msg="Server rejected the download (client id length ${#bad_cid}, need 40). Re-run Connect."
+          else
+            msg="Server denied download permission for this library (HTTP 400). Check account access, then retry Connect."
+          fi
         else
           msg="Server denied download permission for this library (HTTP 400). Check account access, then retry Connect."
         fi

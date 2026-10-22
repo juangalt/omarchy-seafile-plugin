@@ -474,8 +474,11 @@ def enrich_unknown_error(repo_id: str, repo_name: str, error: str) -> str:
         ):
             relevant.append(line)
     blob = "\n".join(relevant[-12:])
-    if re.search(r"client_id=&", blob):
+    m = re.search(r"client_id=([0-9a-fA-F]*)&", blob)
+    if m is not None and m.group(1) == "":
         return "Server rejected download (empty client id) — open Connect / repair"
+    if m is not None and len(m.group(1)) != 40:
+        return "Server rejected download (client id must be 40 hex chars) — open Connect / repair"
     if re.search(r"Download permission denied|permission-check.*400|Bad response code.*400", blob):
         return "Download permission denied by server — open Connect / repair"
     if re.search(r"Internal data corrupt", blob):
@@ -733,8 +736,10 @@ def build_status() -> dict:
         ts = int(last_by_name.get(name) or 0)
         if ts > last_sync_ts:
             last_sync_ts = ts
-        err = enrich_unknown_error(rid, name, str(repo.get("error") or ""))
-        entry = _repo_entry(rid, name, str(repo.get("state") or ""), path, ts, err)
+        state = str(repo.get("state") or "")
+        raw_err = str(repo.get("error") or "")
+        err = "" if state == "synchronized" else enrich_unknown_error(rid, name, raw_err)
+        entry = _repo_entry(rid, name, state, path, ts, err)
         if "progress" in repo:
             entry["progress"] = repo.get("progress")
         repos.append(entry)
