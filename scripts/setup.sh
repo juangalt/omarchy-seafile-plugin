@@ -167,8 +167,8 @@ run_seaf_capture() {
   set -e
   {
     echo "\$ $(redact_cmd "$@")   # $label"
-    # Redact any accidental secret echoes from child output (unlikely).
-    echo "$SEAF_OUT" | sed -E 's/(token["'\'']?\s*[:=]\s*)[^[:space:]"',:}]+/\1***/Ig'
+    # Keep command output; secrets should never appear there from seaf-cli.
+    printf '%s\n' "$SEAF_OUT"
     echo "(exit $SEAF_RC)"
   } >>"$LOG_FILE"
   return "$SEAF_RC"
