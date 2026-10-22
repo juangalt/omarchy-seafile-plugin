@@ -244,6 +244,118 @@ explain_seaf_error() {
   echo "Seafile command failed. See the log for the full output."
 }
 
+# seaf-daemon sends client_id on every download permission-check. An empty
+# value makes the server return HTTP 400 ("Unknown error" in status).
+ensure_client_id() {
+  local current cid cname
+  current=$("${SEAF[@]}" config -k client_id 2>/dev/null | sed -n 's/^client_id = //p' | tr -d '[:space:]')
+  if [[ -n $current ]]; then
+    return 0
+  fi
+  if [[ -f ${DATA_DIR}/id ]]; then
+    cid=$(tr -d '[:space:]' <"${DATA_DIR}/id")
+  fi
+  if [[ -z ${cid:-} ]]; then
+    cid=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+    mkdir -p "$DATA_DIR"
+    printf '%s\n' "$cid" >"${DATA_DIR}/id"
+    chmod 600 "${DATA_DIR}/id" 2>/dev/null || true
+  fi
+  log "client_id was empty — setting to ${cid:0:8}… and restarting daemon"
+  echo "Fixing empty Seafile client id (required by the server)…"
+  "${SEAF[@]}" config -k client_id -v "$cid" >/dev/null 2>&1 || true
+  cname=$("${SEAF[@]}" config -k client_name 2>/dev/null | sed -n 's/^client_name = //p' | tr -d '[:space:]')
+  if [[ -z $cname ]]; then
+    "${SEAF[@]}" config -k client_name -v "$(hostname -s 2>/dev/null || echo seafile)" >/dev/null 2>&1 || true
+  fi
+  if systemctl --user is-enabled seaf-daemon.service >/dev/null 2>&1; then
+    systemctl --user restart seaf-daemon.service >/dev/null 2>&1 || true
+  else
+    "${SEAF[@]}" stop >/dev/null 2>&1 || true
+    "${SEAF[@]}" start >/dev/null 2>&1 || true
+  fi
+  sleep 1
+}
+
+# seaf-cli sync/download return as soon as the clone task is queued. Wait until
+# the library appears in `list`, or fail with the real clone/log error.
+await_clone_success() {
+  local repo_id=$1
+  local timeout=${2:-180}
+  local deadline state err msg line
+  deadline=$((SECONDS + timeout))
+  echo "Waiting for library download to finish…"
+  while ((SECONDS < deadline)); do
+    if "${SEAF[@]}" list --json 2>/dev/null | python3 -c '
+import json, sys
+rid = sys.argv[1]
+try:
+    repos = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(str(r.get("id") or "") == rid for r in (repos or []) if isinstance(r, dict)) else 1)
+' "$repo_id"; then
+      log "Clone finished: library $repo_id is listed locally"
+      return 0
+    fi
+    # Inspect clone task state via RPC.
+    read -r state err < <(python3 - "$repo_id" "$DATA_DIR" <<'PY' || true
+import sys
+from pathlib import Path
+repo_id, datadir = sys.argv[1], Path(sys.argv[2])
+sock = datadir / "seafile.sock"
+if not sock.exists():
+    print("none 0")
+    raise SystemExit(0)
+try:
+    from seafile.rpcclient import SeafileRpcClient
+    client = SeafileRpcClient(str(sock))
+except Exception:
+    print("none 0")
+    raise SystemExit(0)
+for task in client.get_clone_tasks() or []:
+    rid = getattr(task, "repo_id", None) or ""
+    if rid != repo_id:
+        continue
+    state = str(getattr(task, "state", "") or "")
+    err = getattr(task, "error", 0) or 0
+    print(f"{state} {err}")
+    raise SystemExit(0)
+print("none 0")
+PY
+)
+    state=${state:-none}
+    err=${err:-0}
+    case "$state" in
+    done | success | finished)
+      log "Clone task state=$state for $repo_id"
+      return 0
+      ;;
+    error | canceled | cancelled)
+      msg="Clone failed (state=$state"
+      if [[ $err != 0 && $err != 28 && $err != 29 ]]; then
+        msg+=" error=$err"
+      fi
+      msg+=")"
+      line=$(grep -E "${repo_id}|${repo_id:0:8}|permission denied|Bad response code" \
+        "${CONF_DIR}/logs/seafile.log" 2>/dev/null | tail -8 || true)
+      if grep -qi 'permission denied\|Bad response code.*400' <<<"$line"; then
+        if grep 'client id = ,' "${CONF_DIR}/logs/seafile.log" 2>/dev/null | tail -3 | grep -q 'client id = ,'; then
+          msg="Server rejected the download because this client had an empty client id. Re-run Connect."
+        else
+          msg="Server denied download permission for this library (HTTP 400). Check account access, then retry Connect."
+        fi
+      elif [[ -n $line ]]; then
+        msg="Clone failed. Last log: $(tail -1 <<<"$line")"
+      fi
+      fail "$msg"
+      ;;
+    esac
+    sleep 1
+  done
+  fail "Timed out waiting for library $repo_id to finish downloading. See ${CONF_DIR}/logs/seafile.log"
+}
+
 # Cancel leftover clone tasks for a library (failed earlier attempts leave
 # "Task is already in progress"). Restart the daemon if a canceled task sticks.
 clear_clone_tasks_for() {
@@ -624,6 +736,8 @@ if ! "${SEAF[@]}" status >/dev/null 2>&1; then
   sleep 1
 fi
 
+ensure_client_id
+
 if "${SEAF[@]}" list 2>/dev/null | awk 'NR>1{found=1} END{exit !found}'; then
   echo
   echo "Local libraries already configured:"
@@ -675,6 +789,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
         -u "$username" \
         -T "$existing_token" \
         -d "$existing_worktree"; then
+        await_clone_success "$existing_id"
         echo
         echo "Libraries:"
         "${SEAF[@]}" list || true
@@ -692,6 +807,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
           -u "$username" \
           -T "$existing_token" \
           -d "$existing_worktree"; then
+          await_clone_success "$existing_id"
           echo
           echo "Libraries:"
           "${SEAF[@]}" list || true
@@ -741,6 +857,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
         fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
       fi
     fi
+    await_clone_success "$existing_id"
     echo
     echo "Libraries:"
     "${SEAF[@]}" list || true
@@ -833,6 +950,8 @@ else
     fi
   fi
 fi
+
+await_clone_success "$lib_id"
 
 echo
 echo "Libraries:"

@@ -398,18 +398,24 @@ def has_leftover_worktree(bindings: list[dict], deleted_ids: set[str]) -> bool:
     return False
 
 
-def last_sync_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
-    """Map repo name -> unix timestamp of last transition to synchronized."""
+def _read_seafile_log_tail(limit_bytes: int = 200_000) -> str:
     if not LOG_PATH.exists():
-        return {}
+        return ""
     try:
         size = LOG_PATH.stat().st_size
         with LOG_PATH.open("rb") as handle:
             if size > limit_bytes:
                 handle.seek(size - limit_bytes)
                 handle.readline()
-            data = handle.read().decode("utf-8", errors="replace")
+            return handle.read().decode("utf-8", errors="replace")
     except OSError:
+        return ""
+
+
+def last_sync_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
+    """Map repo name -> unix timestamp of last transition to synchronized."""
+    data = _read_seafile_log_tail(limit_bytes)
+    if not data:
         return {}
 
     found: dict[str, int] = {}
@@ -425,6 +431,37 @@ def last_sync_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
         if sync_match and current_ts > 0:
             found[sync_match.group(1)] = current_ts
     return found
+
+
+def enrich_unknown_error(repo_id: str, repo_name: str, error: str) -> str:
+    """Replace seaf-cli's opaque 'Unknown error' with a useful log hint."""
+    text = (error or "").strip()
+    if text.lower() not in ("unknown error", "unknown", ""):
+        return text
+    rid = (repo_id or "").strip()
+    short = rid[:8] if rid else ""
+    name = (repo_name or "").strip()
+    data = _read_seafile_log_tail(80_000)
+    if not data:
+        return text or "Unknown error"
+    relevant: list[str] = []
+    for line in data.splitlines():
+        if short and short in line:
+            relevant.append(line)
+        elif rid and rid in line:
+            relevant.append(line)
+        elif name and name in line and (
+            "error" in line.lower() or "denied" in line.lower() or "Bad response" in line
+        ):
+            relevant.append(line)
+    blob = "\n".join(relevant[-12:])
+    if re.search(r"client_id=&", blob):
+        return "Server rejected download (empty client id) — open Connect / repair"
+    if re.search(r"Download permission denied|permission-check.*400|Bad response code.*400", blob):
+        return "Download permission denied by server — open Connect / repair"
+    if re.search(r"Internal data corrupt", blob):
+        return "Internal data corrupt on the client — open Connect / repair"
+    return text or "Unknown error"
 
 
 def aggregate_state(repos: list) -> str:
@@ -677,7 +714,8 @@ def build_status() -> dict:
         ts = int(last_by_name.get(name) or 0)
         if ts > last_sync_ts:
             last_sync_ts = ts
-        entry = _repo_entry(rid, name, str(repo.get("state") or ""), path, ts, str(repo.get("error") or ""))
+        err = enrich_unknown_error(rid, name, str(repo.get("error") or ""))
+        entry = _repo_entry(rid, name, str(repo.get("state") or ""), path, ts, err)
         if "progress" in repo:
             entry["progress"] = repo.get("progress")
         repos.append(entry)
