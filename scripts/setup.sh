@@ -10,10 +10,8 @@ LOG_DIR="${HOME}/.local/state/omarchy/plugins/juangalt.seafile"
 LOG_FILE="${LOG_DIR}/setup.log"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Cloudflare often blocks Python-urllib's default User-Agent (error 1010).
-# Network-facing seaf-cli calls go through this wrapper.
-seaf() {
-  python3 "$SCRIPT_DIR/seaf_cli_ua.py" "$@"
-}
+# Use a real argv (not a bash function) so setsid/exec can run it.
+SEAF=(python3 "$SCRIPT_DIR/seaf_cli_ua.py")
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -557,19 +555,19 @@ echo
 if [[ ! -f "${CONF_DIR}/seafile.ini" ]]; then
   echo "Initializing Seafile client data under ${DATA_PARENT}"
   log "seaf-cli init -d $DATA_PARENT"
-  run_seaf "Initialize client" seaf init -d "$DATA_PARENT" >/dev/null
+  run_seaf "Initialize client" "${SEAF[@]}" init -d "$DATA_PARENT" >/dev/null
 fi
 
-if ! seaf status >/dev/null 2>&1; then
+if ! "${SEAF[@]}" status >/dev/null 2>&1; then
   echo "Starting seafile daemon…"
-  run_seaf "Start daemon" seaf start >/dev/null
+  run_seaf "Start daemon" "${SEAF[@]}" start >/dev/null
   sleep 1
 fi
 
-if seaf list 2>/dev/null | awk 'NR>1{found=1} END{exit !found}'; then
+if "${SEAF[@]}" list 2>/dev/null | awk 'NR>1{found=1} END{exit !found}'; then
   echo
   echo "Local libraries already configured:"
-  seaf list || true
+  "${SEAF[@]}" list || true
   echo
   if ! gum confirm "Add another library?"; then
     echo "Done."
@@ -610,7 +608,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
 
     if [[ -n $existing_token ]]; then
       echo "Re-attaching with saved token → $existing_worktree"
-      if run_seaf_allow_libpass "Re-attach library (token)" seaf sync \
+      if run_seaf_allow_libpass "Re-attach library (token)" "${SEAF[@]}" sync \
         -l "$existing_id" \
         -s "$server" \
         -u "$username" \
@@ -618,7 +616,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
         -d "$existing_worktree"; then
         echo
         echo "Libraries:"
-        seaf list || true
+        "${SEAF[@]}" list || true
         echo
         echo "Setup complete (re-attached existing binding)."
         log "Repair sync succeeded (token)"
@@ -645,7 +643,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
     obtain_token_checked "$server" "$username" "$password" "$tfa"
     unset password tfa
     echo "Syncing ${existing_id} → ${existing_worktree}"
-    if ! run_seaf_allow_libpass "Sync library" seaf sync \
+    if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync \
       -l "$existing_id" \
       -s "$server" \
       -u "$username" \
@@ -655,7 +653,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
     fi
     echo
     echo "Libraries:"
-    seaf list || true
+    "${SEAF[@]}" list || true
     echo
     echo "Setup complete (re-attached with fresh login)."
     log "Repair sync succeeded (password→token)"
@@ -673,7 +671,7 @@ prompt_login "${existing_server:-https://}" "${existing_email:-}"
 
 echo
 echo "Fetching remote libraries from $server …"
-remote_json=$(run_seaf "List remote libraries" seaf list-remote -s "$server" -u "$username" -T "$AUTH_TOKEN" --json)
+remote_json=$(run_seaf "List remote libraries" "${SEAF[@]}" list-remote -s "$server" -u "$username" -T "$AUTH_TOKEN" --json)
 
 mapfile -t choices < <(printf '%s\n' "$remote_json" | python3 -c '
 import json, sys
@@ -721,21 +719,21 @@ mode=$(gum choose --header "How should this library land locally?" \
 if [[ $mode == Sync* ]]; then
   mkdir -p "$folder"
   echo "Syncing ${lib_name} → ${folder}"
-  if ! run_seaf_allow_libpass "Sync library" seaf sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder"; then
+  if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder"; then
     fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
   fi
 else
   parent=$(dirname "$folder")
   mkdir -p "$parent"
   echo "Downloading ${lib_name} under ${parent}"
-  if ! run_seaf_allow_libpass "Download library" seaf download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent"; then
+  if ! run_seaf_allow_libpass "Download library" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent"; then
     fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
   fi
 fi
 
 echo
 echo "Libraries:"
-seaf list || true
+"${SEAF[@]}" list || true
 echo
 echo "Setup complete."
 log "Setup finished OK"
