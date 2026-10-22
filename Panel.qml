@@ -15,28 +15,19 @@ Panel {
 
   readonly property Item panelFlick: panel.loadedContent ? panel.loadedContent.panelFlick : null
   readonly property Item hero: panel.loadedContent ? panel.loadedContent.hero : null
+  readonly property Item libraryColumn: panel.loadedContent ? panel.loadedContent.libraryColumn : null
 
   Commons.Translations {
     id: strings
-    directory: Qt.resolvedUrl("i18n")
+    directory: root.pluginDir.charAt(0) === "/" ? root.pluginDir + "/i18n" : Qt.resolvedUrl("i18n")
   }
 
-  readonly property string pluginDir: {
-    var url = String(Qt.resolvedUrl("."))
-    if (url.indexOf("file://") === 0) {
-      var path = url.substring(7)
-      if (path.indexOf("//") === 0) path = path.substring(1)
-      try { path = decodeURIComponent(path) } catch (e) {}
-      if (path.length > 1 && path.charAt(path.length - 1) === "/")
-        path = path.substring(0, path.length - 1)
-      return path
-    }
-    return url
-  }
+  readonly property string pluginDir: Model.fileUrlToPath(String(Qt.resolvedUrl(".")))
 
   property string focusSection: "setup"
   property int actionIndex: 0
   property int moreIndex: 0
+  property int libraryIndex: 0
   property bool cursorActive: false
   property bool moreOpen: false
 
@@ -44,7 +35,10 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property bool attention: seafile.aggregate === "error" || seafile.aggregate === "needs-resync"
+  readonly property bool attention: {
+    var aggregate = seafile.aggregate
+    return aggregate === "error" || aggregate === "needs-resync" || aggregate === "unreachable"
+  }
   readonly property color iconColor: {
     if (!seafile.installed || !seafile.configured) return dim
     if (root.attention) return urgent
@@ -59,18 +53,23 @@ Panel {
   }
   readonly property string toggleHint: seafile.active ? strings.t("pauseSyncing") : strings.t("resumeSyncing")
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && seafile.installed && seafile.configured
-  readonly property string heroMetaText: Model.heroMeta({
-    installed: seafile.installed,
-    configured: seafile.configured,
-    active: seafile.active,
-    snoozed: seafile.snoozed,
-    snoozeUntil: seafile.snoozeUntil,
-    snoozeLabel: seafile.snoozeLabel,
-    statusText: seafile.statusText,
-    lastSyncTs: seafile.lastSyncTs,
-    aggregate: seafile.aggregate,
-    syncErrors: seafile.syncErrors
-  }, strings, Commons.I18n.formatNumber)
+  readonly property string heroMetaText: {
+    var _lang = strings.language
+    return Model.heroMeta({
+      installed: seafile.installed,
+      configured: seafile.configured,
+      active: seafile.active,
+      snoozed: seafile.snoozed,
+      snoozeUntil: seafile.snoozeUntil,
+      snoozeLabel: seafile.snoozeLabel,
+      runningDespiteSnooze: seafile.runningDespiteSnooze,
+      statusText: seafile.statusText,
+      lastSyncTs: seafile.lastSyncTs,
+      aggregate: seafile.aggregate,
+      syncErrors: seafile.syncErrors,
+      detail: seafile.detail
+    }, root.tr, Commons.I18n.formatNumber)
+  }
 
   readonly property var primaryActions: {
     var items = []
@@ -94,16 +93,23 @@ Panel {
     return items
   }
 
+  function tr(key, fallback) {
+    return strings.t(key, fallback)
+  }
+
   function ensureCursor() {
     if (!seafile.installed || !seafile.configured) {
       focusSection = "setup"
       actionIndex = 0
       moreIndex = 0
+      libraryIndex = 0
       return
     }
     if (focusSection === "setup") focusSection = "header"
+    if (focusSection === "libraries" && seafile.repos.length === 0) focusSection = "header"
     if (focusSection === "actions" && primaryActions.length === 0) focusSection = "header"
     if (focusSection === "more" && (!moreOpen || moreActions.length === 0)) focusSection = "header"
+    if (libraryIndex >= seafile.repos.length) libraryIndex = Math.max(0, seafile.repos.length - 1)
     if (actionIndex >= primaryActions.length) actionIndex = Math.max(0, primaryActions.length - 1)
     if (moreIndex >= moreActions.length) moreIndex = Math.max(0, moreActions.length - 1)
   }
@@ -116,16 +122,47 @@ Panel {
     if (focusSection === "setup") return
 
     if (focusSection === "header") {
-      if (dy > 0 && primaryActions.length > 0) {
-        focusSection = "actions"
-        actionIndex = 0
+      if (dy > 0) {
+        if (seafile.repos.length > 0) {
+          focusSection = "libraries"
+          libraryIndex = 0
+        } else if (primaryActions.length > 0) {
+          focusSection = "actions"
+          actionIndex = 0
+        }
       }
+      scrollCursorIntoView()
+      return
+    }
+
+    if (focusSection === "libraries") {
+      if (dy < 0 && libraryIndex === 0) {
+        focusSection = "header"
+        scrollCursorIntoView()
+        return
+      }
+      if (dy > 0 && libraryIndex >= seafile.repos.length - 1) {
+        if (primaryActions.length > 0) {
+          focusSection = "actions"
+          actionIndex = 0
+        }
+        scrollCursorIntoView()
+        return
+      }
+      libraryIndex = Math.max(0, Math.min(seafile.repos.length - 1, libraryIndex + dy))
+      scrollCursorIntoView()
       return
     }
 
     if (focusSection === "actions") {
       if (dy < 0 && actionIndex === 0) {
-        focusSection = "header"
+        if (seafile.repos.length > 0) {
+          focusSection = "libraries"
+          libraryIndex = seafile.repos.length - 1
+        } else {
+          focusSection = "header"
+        }
+        scrollCursorIntoView()
         return
       }
       if (dy > 0 && actionIndex >= primaryActions.length - 1) {
@@ -155,6 +192,35 @@ Panel {
     if (panelFlick) panelFlick.contentY = 0
   }
 
+  function scrollItemIntoView(item) {
+    if (!panelFlick || !item) return
+    Qt.callLater(function() {
+      if (!item) return
+      var margin = Style.space(6)
+      var point = item.mapToItem(panelFlick.contentItem, 0, 0)
+      var top = point.y
+      var bottom = top + item.height
+      var viewTop = panelFlick.contentY
+      var viewBottom = viewTop + panelFlick.height
+      var maxY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+      if (top < viewTop + margin) panelFlick.contentY = Math.max(0, top - margin)
+      else if (bottom > viewBottom - margin) panelFlick.contentY = Math.min(maxY, bottom + margin - panelFlick.height)
+    })
+  }
+
+  function scrollCursorIntoView() {
+    if (focusSection === "libraries" && libraryColumn && libraryIndex >= 0 && libraryIndex < libraryColumn.children.length)
+      scrollItemIntoView(libraryColumn.children[libraryIndex])
+    else if (focusSection === "header" && panelFlick)
+      panelFlick.contentY = 0
+  }
+
+  function openFocusedLibrary() {
+    var repo = seafile.repos[libraryIndex]
+    if (!repo) return
+    seafile.openFolder(String(repo.path || ""))
+  }
+
   function activateCursor() {
     ensureCursor()
     if (focusSection === "setup") {
@@ -166,7 +232,8 @@ Panel {
       seafile.toggleRunning()
       return
     }
-    if (focusSection === "actions") runAction(primaryActions[actionIndex])
+    if (focusSection === "libraries") openFocusedLibrary()
+    else if (focusSection === "actions") runAction(primaryActions[actionIndex])
     else if (focusSection === "more") runAction(moreActions[moreIndex])
   }
 
@@ -196,15 +263,33 @@ Panel {
     moreIndex = index
   }
 
+  function setLibraryCursor(index) {
+    cursorActive = true
+    focusSection = "libraries"
+    libraryIndex = index
+    scrollCursorIntoView()
+  }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
   onOpenedChanged: if (opened) {
     cursorActive = false
     moreOpen = false
+    libraryIndex = 0
     if (panelFlick) panelFlick.contentY = 0
+    ensureCursor()
     seafile.refresh()
     Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
+  }
+
+  onLibraryIndexChanged: scrollCursorIntoView()
+
+  Connections {
+    target: seafile
+    function onReposChanged() { root.ensureCursor() }
+    function onInstalledChanged() { root.ensureCursor() }
+    function onConfiguredChanged() { root.ensureCursor() }
   }
 
   Service {
@@ -263,10 +348,15 @@ Panel {
       id: keyCatcher
       property alias panelFlick: panelFlick
       property alias hero: hero
+      property alias libraryColumn: libraryColumn
       implicitHeight: column.implicitHeight
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
-        if (!root.cursorActive) { root.cursorActive = true; return }
+        if (!root.cursorActive) {
+          root.cursorActive = true
+          root.ensureCursor()
+          return
+        }
         root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
@@ -276,7 +366,10 @@ Panel {
         if (t === "r" || t === "R") seafile.refresh()
         else if (t === "s" || t === "S") seafile.syncNow()
         else if (t === "p" || t === "P") seafile.toggleRunning()
-        else if (t === "o" || t === "O") seafile.openFolder()
+        else if (t === "o" || t === "O") {
+          if (root.focusSection === "libraries") root.openFocusedLibrary()
+          else seafile.openFolder()
+        }
         else if (t === "l" || t === "L") seafile.openLogs()
       }
 
@@ -296,7 +389,6 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(12)
 
-          // —— Hero (configured) ——
           Item {
             id: header
             visible: seafile.installed && seafile.configured
@@ -340,8 +432,7 @@ Panel {
             }
           }
 
-          Text {
-            textFormat: Text.PlainText
+          PlainText {
             visible: seafile.actionStatus !== "" || seafile.lastError !== ""
             width: parent.width
             text: seafile.actionStatus !== "" ? seafile.actionStatus : seafile.lastError
@@ -351,44 +442,44 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          // —— Setup gate ——
           SetupCard {
             visible: !seafile.installed || !seafile.configured
             width: parent.width
           }
 
-          // —— Libraries ——
           Column {
             visible: seafile.installed && seafile.configured
             width: parent.width
             spacing: Style.space(6)
 
-            Repeater {
-              model: seafile.repos
-              delegate: Text {
-                required property var modelData
-                width: parent.width
-                textFormat: Text.PlainText
-                text: String(modelData.name || "") + (modelData.path ? " → " + modelData.path : "")
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideMiddle
+            Column {
+              id: libraryColumn
+              width: parent.width
+              spacing: Style.space(2)
+
+              Repeater {
+                model: seafile.repos
+                LibraryRow {
+                  required property var modelData
+                  required property int index
+                  width: parent.width
+                  repo: modelData
+                  rowIndex: index
+                }
               }
             }
 
-            Text {
+            PlainText {
               visible: seafile.repos.length === 0
               width: parent.width
-              textFormat: Text.PlainText
               text: strings.t("noLibraries")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
             }
           }
 
-          // —— Primary actions ——
           Column {
             visible: seafile.installed && seafile.configured && root.primaryActions.length > 0
             width: parent.width
@@ -412,7 +503,6 @@ Panel {
             foreground: root.foreground
           }
 
-          // —— More ——
           Column {
             visible: seafile.installed && seafile.configured
             width: parent.width
@@ -439,16 +529,14 @@ Panel {
                 anchors.leftMargin: Style.space(10)
                 anchors.rightMargin: Style.space(10)
 
-                Text {
-                  textFormat: Text.PlainText
+                PlainText {
                   text: strings.t("more")
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   Layout.fillWidth: true
                 }
-                Text {
-                  textFormat: Text.PlainText
+                PlainText {
                   text: root.moreOpen ? "󰅀" : "󰅂"
                   color: root.dim
                   font.family: root.fontFamily
@@ -510,22 +598,88 @@ Panel {
       anchors.margins: Style.space(10)
       spacing: Style.space(4)
 
-      Text {
-        textFormat: Text.PlainText
+      PlainText {
         Layout.fillWidth: true
         text: !seafile.installed ? strings.t("install") : strings.t("setup")
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
       }
-      Text {
-        textFormat: Text.PlainText
+      PlainText {
         Layout.fillWidth: true
         text: !seafile.installed ? strings.t("installHelp") : strings.t("setupHelp")
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+      }
+    }
+  }
+
+  component LibraryRow: CursorSurface {
+    id: libraryRow
+    property var repo: null
+    property int rowIndex: 0
+
+    readonly property string repoName: {
+      var name = repo ? String(repo.name || "") : ""
+      return name !== "" ? name : strings.t("library")
+    }
+    readonly property string repoMeta: {
+      var _lang = strings.language
+      return Model.libraryMeta(repo, root.tr)
+    }
+    readonly property string repoError: Model.libraryError(repo)
+    readonly property string repoPath: repo ? String(repo.path || "") : ""
+
+    hasCursor: root.cursorActive && root.focusSection === "libraries" && root.libraryIndex === rowIndex
+    foreground: root.foreground
+    implicitHeight: libraryContent.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: libraryRow.repoPath.charAt(0) === "/" ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onEntered: root.setLibraryCursor(libraryRow.rowIndex)
+      onClicked: seafile.openFolder(libraryRow.repoPath)
+    }
+
+    ColumnLayout {
+      id: libraryContent
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(1)
+
+      PlainText {
+        Layout.fillWidth: true
+        text: libraryRow.repoName
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+      }
+      PlainText {
+        visible: libraryRow.repoMeta !== ""
+        Layout.fillWidth: true
+        text: libraryRow.repoMeta
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideMiddle
+      }
+      PlainText {
+        visible: libraryRow.repoError !== ""
+        Layout.fillWidth: true
+        text: libraryRow.repoError
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        maximumLineCount: 3
+        elide: Text.ElideRight
       }
     }
   }
@@ -565,16 +719,14 @@ Panel {
       anchors.rightMargin: Style.space(10)
       spacing: Style.space(8)
 
-      Text {
-        textFormat: Text.PlainText
+      PlainText {
         text: actionRow.action ? String(actionRow.action.icon || "") : ""
         color: actionRow.dimmed ? root.dim : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.icon
         Layout.alignment: Qt.AlignVCenter
       }
-      Text {
-        textFormat: Text.PlainText
+      PlainText {
         Layout.fillWidth: true
         text: actionRow.action ? String(actionRow.action.label || "") : ""
         color: actionRow.dimmed ? root.dim : root.foreground
@@ -583,5 +735,9 @@ Panel {
         elide: Text.ElideRight
       }
     }
+  }
+
+  component PlainText: Text {
+    textFormat: Text.PlainText
   }
 }

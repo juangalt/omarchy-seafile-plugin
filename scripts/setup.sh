@@ -16,7 +16,10 @@ need() {
 }
 
 ensure_log() {
+  umask 077
   mkdir -p "$LOG_DIR"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
   {
     echo
     echo "===== $(date -Iseconds) setup pid=$$ ====="
@@ -30,8 +33,13 @@ log() {
   printf '%s\n' "$*" >&2
 }
 
+clear_secrets() {
+  unset AUTH_TOKEN existing_token password tfa
+}
+
 fail() {
   local msg=$1
+  clear_secrets
   echo
   echo "✗ $msg" >&2
   echo
@@ -42,6 +50,8 @@ fail() {
 }
 
 # Redact -p / -T / --password / --token values before anything hits the log.
+# Separate args (-T secret) and attached args (-Tsecret, --token=secret).
+# Attached forms without '=' log only the flag so the secret is not kept.
 redact_cmd() {
   local out=()
   local skip_next=0
@@ -57,8 +67,32 @@ redact_cmd() {
       out+=("$arg")
       skip_next=1
       ;;
-    -p* | --password=* | -T* | --token=* | -a* | --tfa=* | -e* | --libpasswd=*)
+    --libpasswd=* | --password=* | --token=* | --tfa=* | -p=* | -T=* | -a=* | -e=*)
       out+=("${arg%%=*}='***'")
+      ;;
+    --libpasswd*)
+      out+=("--libpasswd")
+      ;;
+    --password*)
+      out+=("--password")
+      ;;
+    --token*)
+      out+=("--token")
+      ;;
+    --tfa*)
+      out+=("--tfa")
+      ;;
+    -p*)
+      out+=("-p")
+      ;;
+    -T*)
+      out+=("-T")
+      ;;
+    -a*)
+      out+=("-a")
+      ;;
+    -e*)
+      out+=("-e")
       ;;
     *)
       out+=("$arg")
@@ -89,6 +123,11 @@ validate_server_url() {
     echo "Server URL is empty."
     return 1
   fi
+  # Reject before any error text echoes the URL (user:pass@host).
+  if [[ $url =~ ://[^[:space:]/]*@ ]]; then
+    echo "Server URL must not include a username or password."
+    return 1
+  fi
   if [[ ! $url =~ ^https?:// ]]; then
     echo "Server URL must start with http:// or https:// (got: $url)."
     return 1
@@ -100,11 +139,34 @@ validate_server_url() {
   return 0
 }
 
+# https is the default. Cleartext is an explicit, logged choice.
+confirm_cleartext_http() {
+  local url=$1
+  if [[ $url != http://* ]]; then
+    return 0
+  fi
+  if gum confirm "Use cleartext HTTP? Password will be sent unencrypted."; then
+    log "Accepted cleartext HTTP for $url"
+    return 0
+  fi
+  log "Declined cleartext HTTP for $url"
+  fail "Refusing to send your password over cleartext HTTP."
+}
+
 is_auth_error() {
-  # Seafile often returns HTTP 400 with "Unable to login with provided credentials"
-  # for a bad password (not 401). Do NOT match bare "timeout" — Python urlopen
-  # tracebacks contain that parameter name on every failure.
-  grep -qiE 'HTTP Error 401|HTTP Error 403|HTTP Error 400|HTTPError: HTTP Error 40[013]|Unable to login with provided credentials|incorrect email or password|wrong password|invalid token|non_field_errors' <<<"$1"
+  # Credential failures only. Seafile uses HTTP 400 with
+  # "Unable to login with provided credentials" for a bad password, and
+  # HTTP 401 / "invalid token" when a saved token is rejected.
+  # Do NOT treat every HTTP 400 or 403 as a bad password.
+  # Do NOT match bare "timeout" — Python urlopen tracebacks contain that
+  # parameter name on every failure.
+  grep -qiE 'Unable to login with provided credentials|invalid token|HTTP Error 401|HTTPError: HTTP Error 401' <<<"$1"
+}
+
+is_encrypted_lib_error() {
+  # Library-password hints from seaf-cli (getpass prompt or encrypt errors).
+  # Account-password failures are classified by is_auth_error instead.
+  grep -qiE 'password for the library|library password|libpasswd|encrypt' <<<"$1"
 }
 
 # Map noisy seaf-cli / urllib failures to one actionable sentence.
@@ -117,12 +179,10 @@ explain_seaf_error() {
     return
   fi
   if is_auth_error "$output"; then
-    if grep -qiE 'HTTP Error 401|invalid token' <<<"$output"; then
+    if grep -qiE 'invalid token|HTTP Error 401|HTTPError: HTTP Error 401' <<<"$output"; then
       echo "Saved login token was rejected (401). Sign in again with your password."
-    elif grep -qiE 'Unable to login|HTTP Error 400|non_field_errors' <<<"$output"; then
-      echo "Username/password rejected by the server. Check credentials, and enable 2FA in the next prompt if your account uses it."
     else
-      echo "Login failed. Check username, password, and 2FA."
+      echo "Username/password rejected by the server. Check credentials, and enable 2FA in the next prompt if your account uses it."
     fi
     return
   fi
@@ -134,8 +194,8 @@ explain_seaf_error() {
     echo "Could not reach ${server:-the server}. Is it online, and is the port correct?"
     return
   fi
-  if grep -qiE 'certificate verify failed|SSLError|ssl\.SSLError' <<<"$output"; then
-    echo "TLS/certificate problem talking to the server. Try http:// only if you trust the LAN URL."
+  if grep -qiE 'certificate verify failed|SSLError|ssl\.SSLError|CERTIFICATE_VERIFY_FAILED' <<<"$output"; then
+    echo "TLS/certificate problem talking to the server. Fix the certificate, or confirm a trusted LAN URL separately."
     return
   fi
   if grep -qi 'already used by another Seafile client' <<<"$output"; then
@@ -144,6 +204,10 @@ explain_seaf_error() {
   fi
   if grep -qi 'No such file or directory' <<<"$output"; then
     echo "A local path from the sync command does not exist."
+    return
+  fi
+  if is_encrypted_lib_error "$output"; then
+    echo "This library is encrypted. Re-run setup; encrypted libraries need a library password."
     return
   fi
 
@@ -156,13 +220,28 @@ explain_seaf_error() {
   echo "Seafile command failed. See the log for the full output."
 }
 
+# sync/download call getpass() for an encrypted library. Capturing stderr
+# hides that prompt and the read blocks. Detach from the tty and close
+# stdin so it fails fast; the caller can then ask with gum and pass -e.
+seaf_cli_prompts_for_library() {
+  [[ ${1:-} == seaf-cli && ( ${2:-} == sync || ${2:-} == download ) ]]
+}
+
 # Runs a command; on failure sets SEAF_RC / SEAF_OUT and returns non-zero
 # without exiting. Logs a redacted command line always.
 run_seaf_capture() {
   local label=$1
   shift
   set +e
-  SEAF_OUT=$("$@" 2>&1)
+  if seaf_cli_prompts_for_library "$@"; then
+    if command -v setsid >/dev/null 2>&1; then
+      SEAF_OUT=$(setsid --wait "$@" </dev/null 2>&1)
+    else
+      SEAF_OUT=$("$@" </dev/null 2>&1)
+    fi
+  else
+    SEAF_OUT=$("$@" 2>&1)
+  fi
   SEAF_RC=$?
   set -e
   {
@@ -172,6 +251,30 @@ run_seaf_capture() {
     echo "(exit $SEAF_RC)"
   } >>"$LOG_FILE"
   return "$SEAF_RC"
+}
+
+# Like run_seaf_capture, but an encrypted library can be retried once with
+# a library password collected by gum (-e), not seaf-cli's getpass.
+run_seaf_allow_libpass() {
+  local label=$1
+  shift
+  if run_seaf_capture "$label" "$@"; then
+    return 0
+  fi
+  if is_encrypted_lib_error "$SEAF_OUT" && ! is_auth_error "$SEAF_OUT"; then
+    local libpass=""
+    echo "This library is encrypted. Encrypted libraries need a library password." >&2
+    echo "Enter it now, or leave it empty to abort and re-run setup later." >&2
+    libpass=$(gum input --password --placeholder "library password" --prompt "Library password> ") || libpass=""
+    if [[ -n $libpass ]]; then
+      if run_seaf_capture "$label" "$@" -e "$libpass"; then
+        unset libpass
+        return 0
+      fi
+    fi
+    unset libpass
+  fi
+  return 1
 }
 
 run_seaf() {
@@ -185,20 +288,65 @@ run_seaf() {
 
 # POST /api2/auth-token/ ourselves so we can show Seafile's JSON error body
 # and avoid putting the password on a logged seaf-cli argv.
-# Sets AUTH_TOKEN on success.
+# Sets AUTH_TOKEN on success. Does not follow redirects.
 obtain_token_checked() {
   local server=$1 username=$2 password=$3 tfa=${4:-}
-  local out rc
+  local out rc log_server
   set +e
   out=$(
     SERVER="$server" USERNAME="$username" PASSWORD="$password" TFA="$tfa" DATADIR="$DATA_DIR" python3 - <<'PY'
-import json, os, sys, urllib.error, urllib.parse, urllib.request, secrets
+import json, os, ssl, sys, urllib.error, urllib.parse, urllib.request, secrets
+
+class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects. Auth POST bodies must stay on the requested host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"refusing redirect to {newurl}", headers, fp
+        )
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        location = headers.get("Location") or headers.get("URI") or ""
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"refusing redirect to {location}", headers, fp
+        )
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+def is_tls_error(exc):
+    seen = []
+    if exc is not None:
+        seen.append(exc)
+    reason = getattr(exc, "reason", None)
+    if reason is not None and reason is not exc:
+        seen.append(reason)
+    for item in seen:
+        if isinstance(item, ssl.SSLError):
+            return True
+        text = str(item).lower()
+        if "certificate" in text or "ssl" in text or "tls" in text:
+            return True
+    return False
+
+TLS_MSG = (
+    "TLS/certificate problem talking to the server. "
+    "Fix the certificate, or confirm a trusted LAN URL separately."
+)
 
 server = os.environ["SERVER"].rstrip("/")
 username = os.environ["USERNAME"]
 password = os.environ["PASSWORD"]
 tfa = os.environ.get("TFA") or ""
 datadir = os.environ.get("DATADIR") or ""
+
+parts = urllib.parse.urlsplit(server)
+if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+    print("ERROR\tServer URL must not include userinfo (user:pass@host).")
+    sys.exit(1)
+requested_host = (parts.hostname or "").lower()
+if not requested_host:
+    print("ERROR\tServer URL is missing a host.")
+    sys.exit(1)
 
 idfile = os.path.join(datadir, "id")
 device_id = ""
@@ -225,9 +373,18 @@ headers = {"Content-Type": "application/x-www-form-urlencoded"}
 if tfa:
     headers["X-SEAFILE-OTP"] = tfa
 
+opener = urllib.request.build_opener(RefuseRedirect())
 req = urllib.request.Request(server + "/api2/auth-token/", data=data, headers=headers)
 try:
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with opener.open(req, timeout=20) as resp:
+        final = urllib.parse.urlsplit(resp.geturl())
+        if final.username is not None or final.password is not None or "@" in final.netloc:
+            print("ERROR\tAuth response URL must not include userinfo.")
+            sys.exit(1)
+        final_host = (final.hostname or "").lower()
+        if final_host != requested_host:
+            print("ERROR\tAuth response host does not match the requested server.")
+            sys.exit(1)
         body = resp.read().decode("utf-8", errors="replace")
         payload = json.loads(body)
         token = payload.get("token")
@@ -236,6 +393,9 @@ try:
             sys.exit(2)
         print("OK\t" + token)
 except urllib.error.HTTPError as exc:
+    if 300 <= exc.code < 400:
+        print(f"ERROR\tHTTP {exc.code}: {exc.reason}")
+        sys.exit(1)
     raw = exc.read().decode("utf-8", errors="replace")
     detail = raw.strip() or str(exc.reason)
     try:
@@ -249,15 +409,32 @@ except urllib.error.HTTPError as exc:
         pass
     print(f"ERROR\tHTTP {exc.code}: {detail}")
     sys.exit(1)
+except urllib.error.URLError as exc:
+    if is_tls_error(exc):
+        print(f"ERROR\t{TLS_MSG}")
+    else:
+        print(f"ERROR\t{exc.reason or exc}")
+    sys.exit(1)
+except ssl.SSLError:
+    print(f"ERROR\t{TLS_MSG}")
+    sys.exit(1)
 except Exception as exc:
-    print(f"ERROR\t{exc}")
+    if is_tls_error(exc):
+        print(f"ERROR\t{TLS_MSG}")
+    else:
+        print(f"ERROR\t{exc}")
     sys.exit(1)
 PY
   )
   rc=$?
   set -e
+  if [[ $server =~ ://[^[:space:]/]*@ ]]; then
+    log_server="<url-with-userinfo-redacted>"
+  else
+    log_server=$server
+  fi
   {
-    echo "\$ auth-token POST $server  # login check"
+    echo "\$ auth-token POST $log_server  # login check"
     # never log token
     if [[ $out == OK$'\t'* ]]; then
       echo "OK (token acquired)"
@@ -269,7 +446,7 @@ PY
 
   if ((rc != 0)) || [[ $out != OK$'\t'* ]]; then
     local detail=${out#ERROR$'\t'}
-    if [[ $detail == *"Unable to login"* ]]; then
+    if [[ $detail == *"Unable to login with provided credentials"* ]]; then
       fail "Login rejected: wrong username/password${tfa:+, or bad 2FA code}. Server said: Unable to login with provided credentials."
     fi
     fail "Login failed: ${detail:-unknown error}"
@@ -293,6 +470,21 @@ read_existing_binding() {
   " 2>/dev/null || true
 }
 
+accept_server_url() {
+  # Sets server from raw input. Confirms cleartext HTTP. Logs normalization.
+  local raw_server=$1
+  server=$(normalize_server_url "$raw_server")
+  if ! msg=$(validate_server_url "$server"); then
+    log "Rejected server URL"
+    fail "$msg"
+  fi
+  if [[ $server != "$raw_server" ]]; then
+    echo "Using server URL: $server"
+    log "Normalized server URL: '$raw_server' -> '$server'"
+  fi
+  confirm_cleartext_http "$server"
+}
+
 prompt_login() {
   # Sets: server username AUTH_TOKEN (and uses password ephemerally)
   local default_server=$1 default_user=$2
@@ -300,14 +492,7 @@ prompt_login() {
 
   raw_server=$(gum input --value "$default_server" --placeholder "https://seafile.example.com" --prompt "Server URL> ")
   [[ -n $raw_server ]] || fail "Server URL required."
-  server=$(normalize_server_url "$raw_server")
-  if [[ $server != "$raw_server" ]]; then
-    echo "Using server URL: $server"
-    log "Normalized server URL: '$raw_server' -> '$server'"
-  fi
-  if ! msg=$(validate_server_url "$server"); then
-    fail "$msg"
-  fi
+  accept_server_url "$raw_server"
 
   username=$(gum input --value "$default_user" --placeholder "you@example.com" --prompt "Username> ")
   [[ -n $username ]] || fail "Username required."
@@ -323,7 +508,7 @@ prompt_login() {
 
   echo "Signing in to $server …"
   obtain_token_checked "$server" "$username" "$password" "$tfa"
-  # password goes out of scope when function returns; do not export it
+  unset password tfa
 }
 
 need seaf-cli
@@ -385,20 +570,13 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
     raw_server=$(gum input --value "$existing_server" \
       --placeholder "https://seafile.example.com" \
       --prompt "Server URL (edit if the saved one is wrong)> ")
-    server=$(normalize_server_url "$raw_server")
-    if [[ $server != "$raw_server" ]]; then
-      echo "Using server URL: $server"
-      log "Normalized server URL: '$raw_server' -> '$server'"
-    fi
-    if ! msg=$(validate_server_url "$server"); then
-      fail "$msg"
-    fi
+    accept_server_url "$raw_server"
     mkdir -p "$existing_worktree"
     username=$existing_email
 
     if [[ -n $existing_token ]]; then
       echo "Re-attaching with saved token → $existing_worktree"
-      if run_seaf_capture "Re-attach library (token)" seaf-cli sync \
+      if run_seaf_allow_libpass "Re-attach library (token)" seaf-cli sync \
         -l "$existing_id" \
         -s "$server" \
         -u "$username" \
@@ -410,11 +588,13 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
         echo
         echo "Setup complete (re-attached existing binding)."
         log "Repair sync succeeded (token)"
+        clear_secrets
         exit 0
       fi
       why=$(explain_seaf_error "$SEAF_OUT" "$server")
       echo "✗ Token re-attach failed: $why"
       log "Token re-attach failed: $why"
+      unset existing_token
       echo "Continuing with a password login for the same library…"
     else
       echo "No saved token — need a password login for this library."
@@ -429,25 +609,31 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
     fi
     echo "Signing in to $server …"
     obtain_token_checked "$server" "$username" "$password" "$tfa"
-    unset password
+    unset password tfa
     echo "Syncing ${existing_id} → ${existing_worktree}"
-    run_seaf "Sync library" seaf-cli sync \
+    if ! run_seaf_allow_libpass "Sync library" seaf-cli sync \
       -l "$existing_id" \
       -s "$server" \
       -u "$username" \
       -T "$AUTH_TOKEN" \
-      -d "$existing_worktree" >/dev/null
+      -d "$existing_worktree"; then
+      fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    fi
     echo
     echo "Libraries:"
     seaf-cli list || true
     echo
     echo "Setup complete (re-attached with fresh login)."
     log "Repair sync succeeded (password→token)"
+    clear_secrets
     exit 0
   fi
   echo "Continuing with a fresh login…"
   echo
 fi
+
+# Saved library token is only for the re-attach attempt above.
+unset existing_token
 
 prompt_login "${existing_server:-https://}" "${existing_email:-}"
 
@@ -501,12 +687,16 @@ mode=$(gum choose --header "How should this library land locally?" \
 if [[ $mode == Sync* ]]; then
   mkdir -p "$folder"
   echo "Syncing ${lib_name} → ${folder}"
-  run_seaf "Sync library" seaf-cli sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder" >/dev/null
+  if ! run_seaf_allow_libpass "Sync library" seaf-cli sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder"; then
+    fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+  fi
 else
   parent=$(dirname "$folder")
   mkdir -p "$parent"
   echo "Downloading ${lib_name} under ${parent}"
-  run_seaf "Download library" seaf-cli download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent" >/dev/null
+  if ! run_seaf_allow_libpass "Download library" seaf-cli download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent"; then
+    fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+  fi
 fi
 
 echo
@@ -515,3 +705,4 @@ seaf-cli list || true
 echo
 echo "Setup complete."
 log "Setup finished OK"
+clear_secrets

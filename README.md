@@ -2,27 +2,48 @@
 
 Bar widget for [Seafile](https://www.seafile.com/) / `seaf-cli` on [Omarchy](https://omarchy.org/).
 
+It sits on top of an existing `seaf-cli` setup: status in the bar, sync now, pause/snooze, open folder, logs, and a terminal wizard to install or repair a library binding.
+
 ## Install
 
 ```bash
 omarchy plugin add git@github.com:juangalt/omarchy-seafile-plugin.git --enable
 ```
 
-(`omarchy plugin add` disables interactive git prompts, so the SSH URL is the reliable option.)
+Use the SSH URL (`omarchy plugin add` disables interactive HTTPS prompts).
 
-Requires the AUR package `seafile` (provides `seaf-cli`). The panel can install it via `yay` if missing.
+Needs the `seafile` package (provides `seaf-cli`). The panel can install it with `yay` if it is missing.
 
-## Features
+## Use
 
-- Bar icon for sync / error / paused
-- Sync now, pause, snooze (15m / 1h)
-- Open synced folder, show daemon logs
-- Terminal setup wizard for server + library
+| Action | What it does |
+| --- | --- |
+| Left-click icon | Open the panel |
+| Middle-click | Sync now |
+| Right-click | Refresh status |
+| Pause switch | Stops the Seafile daemon (and your user `seaf-daemon.service` if present) |
+| Snooze 15m / 1h | Pause, then auto-resume |
+| Connect / repair | Terminal wizard: re-attach a saved library, or sign in and sync |
 
-## Notes
+Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `https://` if you omit it, and asks before using cleartext HTTP.
 
-Seafile syncs continuously; there is no native “sync every N minutes” setting. Snooze pauses the daemon temporarily.
+## Important
 
-Setup logs land in `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log`. Server URLs must include `http://` or `https://` — the wizard adds `https://` if you omit the scheme.
+- **One Seafile client.** Do not run `seafile-client` (GUI) alongside this. Both use the same data directory and will fight.
+- **Pause stops the whole daemon**, not a single library. If you manage sync with `systemctl --user seaf-daemon.service`, the plugin stops that unit too.
+- **Setup log:** `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log` (mode `600`). Passwords are not written there; account email and server URL may be.
 
-Do not run `seafile-client` (GUI) alongside this plugin’s `seaf-cli` daemon; they fight over the same data directory.
+## Development
+
+```bash
+git clone git@github.com:juangalt/omarchy-seafile-plugin.git
+# edit, then:
+omarchy plugin update juangalt.seafile
+# or symlink the clone into ~/.config/omarchy/plugins/juangalt.seafile
+```
+
+Validate: `omarchy plugin validate .`
+
+## License
+
+MIT — see [LICENSE](LICENSE).

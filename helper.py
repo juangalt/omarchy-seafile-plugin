@@ -7,22 +7,26 @@ Commands print a single JSON object on stdout. Log/diagnostic strings stay Engli
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 CONF_DIR = Path.home() / ".ccnet"
 STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "plugins" / "juangalt.seafile"
 STATE_PATH = STATE_DIR / "state.json"
 LOG_PATH = CONF_DIR / "logs" / "seafile.log"
+SEAF_UNIT = "seaf-daemon.service"
 SYNC_LINE = re.compile(
     r"Repo '([^']+)' sync state transition from '.*' to 'synchronized'"
 )
 TS_LINE = re.compile(r"^\[(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\]")
+_NAME_KEYS = ("sync-worktree-name", "origin-repo-name", "repo-name", "name")
+_REVIVE_STATES = {"active", "activating", "reloading", "deactivating", "failed"}
 
 
 def emit(payload: dict) -> None:
@@ -78,6 +82,204 @@ def seafile_datadir() -> Path | None:
         return None
 
 
+def seafile_sock() -> Path | None:
+    datadir = seafile_datadir()
+    if datadir is None:
+        return None
+    return datadir / "seafile.sock"
+
+
+def owning_daemon_pids() -> list[int]:
+    """PIDs of seaf-daemon whose command line includes this data directory."""
+    datadir = seafile_datadir()
+    if datadir is None:
+        return []
+    needle = str(datadir)
+    found: list[int] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not raw or b"seaf-daemon" not in raw:
+            continue
+        # "pid (comm) state ..." — ignore zombies that no longer own the daemon.
+        state = stat.rsplit(")", 1)[-1].lstrip()[:1]
+        if state == "Z":
+            continue
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        if needle in cmd:
+            found.append(int(entry.name))
+    return found
+
+
+def presence() -> tuple[bool, list[int]]:
+    sock = seafile_sock()
+    return bool(sock is not None and sock.exists()), owning_daemon_pids()
+
+
+def unit_snapshot() -> dict[str, str]:
+    info = {"LoadState": "", "ActiveState": "", "SubState": "", "Job": ""}
+    code, out, _err = run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            SEAF_UNIT,
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "Job",
+        ],
+        timeout=5,
+    )
+    if code != 0:
+        return info
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in info:
+            info[key] = value.strip()
+    return info
+
+
+def unit_may_revive(snap: dict[str, str] | None = None) -> bool:
+    """True when the user unit exists and may start seaf-daemon again."""
+    info = unit_snapshot() if snap is None else snap
+    if info.get("LoadState") != "loaded":
+        return False
+    if info.get("Job"):
+        return True
+    if info.get("SubState") in {"auto-restart", "running", "start", "start-pre"}:
+        return True
+    return info.get("ActiveState") in _REVIVE_STATES
+
+
+def _local_down() -> bool:
+    sock_on, pids = presence()
+    return not sock_on and not pids
+
+
+def _wait_local_down(timeout: float = 2.5) -> None:
+    deadline = time.monotonic() + timeout
+    while not _local_down():
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.2)
+
+
+def daemon_confirmed_stopped() -> bool:
+    """Sock is gone (or status cannot reach a daemon) and nothing owns the data dir.
+
+    A loaded user unit that is still active or scheduled to restart does not count
+    as stopped: systemd would bring seaf-daemon back after seaf-cli stop.
+    """
+    sock_on, pids = presence()
+    if pids or unit_may_revive():
+        return False
+    if not sock_on:
+        return True
+    code, _out, _err = run(["seaf-cli", "status", "--json"], timeout=4)
+    # Exit 0 means the daemon answered. 124 is a hung RPC, not a confirmed stop.
+    return code not in (0, 124)
+
+
+def _stop_error(tried_unit: bool, unit_err: str, cli_err: str) -> str:
+    sock_on, pids = presence()
+    details: list[str] = []
+    if sock_on:
+        details.append("seafile.sock is still present")
+    if pids:
+        details.append(
+            "seaf-daemon still owns the data directory (pid %s)"
+            % ", ".join(str(pid) for pid in pids)
+        )
+    snap = unit_snapshot()
+    if unit_may_revive(snap):
+        details.append(
+            "seaf-daemon.service is %s"
+            % (snap.get("SubState") or snap.get("ActiveState") or "active")
+        )
+    if tried_unit:
+        details.append("systemctl --user stop seaf-daemon.service did not stop it")
+        if unit_err:
+            details.append(unit_err)
+    elif cli_err:
+        details.append(cli_err)
+    message = "Seafile daemon is still running after stop"
+    if details:
+        return message + ": " + "; ".join(details)
+    return message
+
+
+def stop_daemon() -> tuple[bool, str]:
+    """Stop seaf-daemon and require the socket and process to actually be gone."""
+    cli_err = ""
+    if which_seaf():
+        _code, _out, err = run(["seaf-cli", "stop"], timeout=15)
+        cli_err = (err or "").strip()
+    else:
+        cli_err = "seaf-cli not installed"
+
+    _wait_local_down(2.5)
+    tried_unit = False
+    unit_err = ""
+    if not daemon_confirmed_stopped():
+        snap = unit_snapshot()
+        if snap.get("LoadState") == "loaded":
+            tried_unit = True
+            _code, _out, err = run(
+                ["systemctl", "--user", "stop", SEAF_UNIT],
+                timeout=20,
+            )
+            unit_err = (err or "").strip()
+            _wait_local_down(3.0)
+
+    if daemon_confirmed_stopped():
+        return True, ""
+    return False, _stop_error(tried_unit, unit_err, cli_err)
+
+
+def _wait_until_up(timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        sock_on, pids = presence()
+        if sock_on or pids:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def start_daemon() -> tuple[bool, str]:
+    """Start the daemon. Prefer the user unit when it is installed."""
+    snap = unit_snapshot()
+    unit_err = ""
+    if snap.get("LoadState") == "loaded":
+        code, _out, err = run(["systemctl", "--user", "start", SEAF_UNIT], timeout=20)
+        unit_err = (err or "").strip()
+        if code == 0 and _wait_until_up(3.0):
+            return True, ""
+    if not which_seaf():
+        return False, unit_err or "seaf-cli not installed"
+    code, _out, err = run(["seaf-cli", "start"], timeout=15)
+    if code == 0 or _wait_until_up(1.0):
+        return True, ""
+    return False, (err or "").strip() or unit_err or "failed to start seafile daemon"
+
+
 def rpc_client():
     datadir = seafile_datadir()
     if datadir is None:
@@ -121,6 +323,79 @@ def parse_list_json(raw: str) -> list:
         return parsed if isinstance(parsed, list) else []
     except json.JSONDecodeError:
         return []
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_repo_db(db_path: Path | None = None) -> tuple[list[dict], set[str]]:
+    """Return (bindings, deleted_ids) from repo.db.
+
+    bindings are Repo rows with worktree/name taken from RepoProperty.
+    A name missing there falls back to FileSyncError.repo_name in the same db.
+    """
+    if db_path is None:
+        datadir = seafile_datadir()
+        if datadir is None:
+            return [], set()
+        db_path = datadir / "repo.db"
+    if not db_path.exists():
+        return [], set()
+    uri = "file:%s?mode=ro" % str(db_path.resolve()).replace("?", "%3F")
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return [], set()
+    try:
+        try:
+            repo_ids = [str(row[0]) for row in conn.execute("SELECT repo_id FROM Repo")]
+            deleted = {str(row[0]) for row in conn.execute("SELECT repo_id FROM DeletedRepo")}
+            props: dict[str, dict[str, str]] = {}
+            for rid, key, value in conn.execute(
+                "SELECT repo_id, key, value FROM RepoProperty"
+            ):
+                props.setdefault(str(rid), {})[str(key)] = "" if value is None else str(value)
+        except sqlite3.Error:
+            return [], set()
+        names: dict[str, str] = {}
+        try:
+            for rid, name in conn.execute(
+                "SELECT repo_id, repo_name FROM FileSyncError "
+                "WHERE repo_name IS NOT NULL AND repo_name != '' "
+                "ORDER BY timestamp DESC"
+            ):
+                names.setdefault(str(rid), str(name))
+        except sqlite3.Error:
+            names = {}
+    finally:
+        conn.close()
+
+    bindings: list[dict] = []
+    for rid in repo_ids:
+        meta = props.get(rid, {})
+        name = ""
+        for key in _NAME_KEYS:
+            if meta.get(key):
+                name = meta[key]
+                break
+        if not name:
+            name = names.get(rid, "")
+        bindings.append({"id": rid, "name": name, "path": meta.get("worktree") or ""})
+    return bindings, deleted
+
+
+def has_leftover_worktree(bindings: list[dict], deleted_ids: set[str]) -> bool:
+    """Repo row plus a RepoProperty worktree, and the library was not deleted."""
+    for binding in bindings:
+        if binding.get("id") in deleted_ids:
+            continue
+        if str(binding.get("path") or "").strip():
+            return True
+    return False
 
 
 def last_sync_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
@@ -169,21 +444,166 @@ def aggregate_state(repos: list) -> str:
     return states[0] if states else "idle"
 
 
-def apply_snooze(state: dict, running: bool) -> tuple[dict, bool]:
-    """Return (state, snoozed). Auto-resume when the snooze expires."""
+def classify_probe(code: int, err: str, sock_exists: bool, pids: list[int]) -> str:
+    """running | paused | unreachable | unknown.
+
+    paused is a confirmed stop (no seaf-daemon process). A leftover socket after
+    stop is ignored when no process owns the data dir. Timeouts while a process
+    is still expected are unreachable; process up but RPC failing is unknown.
+    """
+    if code == 0:
+        return "running"
+    if code == 124 or "timed out" in (err or "").lower():
+        return "unreachable"
+    if pids:
+        return "unknown"
+    # sock_exists is unused on purpose: stale sockets after stop are common.
+    _ = sock_exists
+    return "paused"
+
+
+class Probe(NamedTuple):
+    kind: str
+    code: int
+    out: str
+    err: str
+    sock: bool
+    pids: tuple[int, ...]
+
+
+def probe_status() -> Probe:
+    code, out, err = run(["seaf-cli", "status", "--json"], timeout=6)
+    sock_on, pids = presence()
+    kind = classify_probe(code, err, sock_on, pids)
+    return Probe(kind, code, out, err, sock_on, tuple(pids))
+
+
+def apply_snooze(state: dict, *, start_if_expired: bool) -> tuple[dict, bool, bool]:
+    """Return (state, snoozed, started). Auto-resume when the snooze expires."""
     until = int(state.get("snoozeUntil") or 0)
     now = int(time.time())
     if until <= 0:
-        return state, False
+        return state, False, False
     if now >= until:
         state = dict(state)
         state.pop("snoozeUntil", None)
         state.pop("snoozeLabel", None)
         save_state(state)
-        if which_seaf() and not running:
-            run(["seaf-cli", "start"], timeout=15)
-        return state, False
-    return state, True
+        started = False
+        if start_if_expired and which_seaf():
+            started, _err = start_daemon()
+        return state, False, started
+    return state, True, False
+
+
+def clear_snooze_state() -> dict:
+    state = load_state()
+    state.pop("snoozeUntil", None)
+    state.pop("snoozeLabel", None)
+    save_state(state)
+    return state
+
+
+def build_sync_errors(raw_errors: list, repos: list, deleted_ids: set[str]) -> list:
+    """Keep repo_id and timestamp. Drop stale errors for synchronized repos.
+
+    When a repo carries its own error string, that string is what the UI should
+    show. File sync_errors for a library that is already synchronized, or that
+    only remains in DeletedRepo, are ignored.
+    """
+    by_id = {
+        str(repo.get("id") or ""): repo
+        for repo in repos
+        if isinstance(repo, dict)
+    }
+    synced = {
+        rid
+        for rid, repo in by_id.items()
+        if str(repo.get("state") or "") == "synchronized"
+    }
+
+    parsed: list[dict] = []
+    for item in raw_errors or []:
+        if not isinstance(item, dict):
+            continue
+        repo_id = str(item.get("repo_id") or item.get("id") or "")
+        entry = {
+            "id": item.get("id", repo_id or None),
+            "repo_id": repo_id,
+            "repoName": str(item.get("repo_name") or item.get("repoName") or ""),
+            "path": str(item.get("path") or ""),
+            "error": str(item.get("error") or item.get("err") or ""),
+            "timestamp": _as_int(item.get("timestamp")),
+        }
+        if item.get("time"):
+            entry["time"] = str(item.get("time"))
+        parsed.append(entry)
+
+    out: list[dict] = []
+    covered: set[str] = set()
+    for repo in repos:
+        if not isinstance(repo, dict):
+            continue
+        rid = str(repo.get("id") or "")
+        if str(repo.get("state") or "") == "synchronized":
+            continue
+        repo_error = str(repo.get("error") or "").strip()
+        if not repo_error:
+            continue
+        match = next((err for err in parsed if err["repo_id"] == rid), None)
+        entry = {
+            "id": (match or {}).get("id", rid or None),
+            "repo_id": rid,
+            "repoName": str(repo.get("name") or (match or {}).get("repoName") or ""),
+            "path": str((match or {}).get("path") or repo.get("path") or ""),
+            "error": repo_error,
+            "timestamp": int((match or {}).get("timestamp") or 0),
+        }
+        if match and match.get("time"):
+            entry["time"] = match["time"]
+        if match and match.get("error") and match["error"] != repo_error:
+            entry["syncError"] = match["error"]
+        out.append(entry)
+        if rid:
+            covered.add(rid)
+
+    for err in parsed:
+        rid = err["repo_id"]
+        if rid and rid in synced:
+            continue
+        if rid and rid in covered:
+            continue
+        if rid and rid in deleted_ids and rid not in by_id:
+            continue
+        out.append(err)
+    return out
+
+
+def _repo_entry(rid: str, name: str, state: str, path: str, ts: int, error: str = "") -> dict:
+    return {
+        "id": rid,
+        "name": name,
+        "state": state,
+        "path": path,
+        "lastSyncTs": ts,
+        "error": error,
+    }
+
+
+def _status_text_for(aggregate: str) -> str:
+    return {
+        "synchronized": "Synchronized",
+        "syncing": "Syncing",
+        "error": "Error",
+        "waiting": "Waiting",
+        "paused": "Paused",
+        "idle": "Idle",
+        "unreachable": "Unreachable",
+        "unknown": "Unknown",
+        "snoozed": "Snoozed",
+        "setup": "Not configured",
+        "needs-resync": "Needs re-attach",
+    }.get(aggregate, aggregate)
 
 
 def build_status() -> dict:
@@ -202,6 +622,7 @@ def build_status() -> dict:
             "snoozed": False,
             "snoozeUntil": 0,
             "snoozeLabel": "",
+            "runningDespiteSnooze": False,
             "aggregate": "missing",
             "statusText": "Not installed",
             "lastSyncTs": 0,
@@ -211,21 +632,38 @@ def build_status() -> dict:
             "worktreeParent": "",
         }
 
-    code, out, err = run(["seaf-cli", "status", "--json"], timeout=6)
-    running = code == 0
-    status = parse_status_json(out) if running else {"repos": [], "sync_errors": []}
-    state, snoozed = apply_snooze(state, running)
+    probe = probe_status()
+    # Only auto-start after expiry when the daemon is confirmed down. A timeout
+    # or a live socket means it may still be up.
+    state, snoozed, started = apply_snooze(state, start_if_expired=probe.kind == "paused")
+    if started:
+        time.sleep(0.4)
+        probe = probe_status()
 
-    # Re-check after possible auto-resume.
-    if not running and which_seaf():
-        code, out, err = run(["seaf-cli", "status", "--json"], timeout=6)
-        running = code == 0
-        status = parse_status_json(out) if running else {"repos": [], "sync_errors": []}
+    running_despite = False
+    stop_detail = ""
+    if snoozed and probe.kind != "paused":
+        stopped, stop_detail = stop_daemon()
+        if stopped:
+            probe = probe_status()
+        else:
+            running_despite = True
 
-    list_code, list_out, _ = run(["seaf-cli", "list", "--json"], timeout=6)
-    listed = parse_list_json(list_out) if list_code == 0 else []
+    running = probe.kind == "running"
+    status = parse_status_json(probe.out) if running else {"repos": [], "sync_errors": []}
+
+    listed: list = []
+    if probe.kind != "unreachable":
+        list_timeout = 6 if running else 4
+        list_code, list_out, _list_err = run(
+            ["seaf-cli", "list", "--json"],
+            timeout=list_timeout,
+        )
+        if list_code == 0:
+            listed = parse_list_json(list_out)
     by_id = {str(item.get("id") or ""): item for item in listed if isinstance(item, dict)}
 
+    bindings, deleted_ids = read_repo_db()
     last_by_name = last_sync_from_log()
     repos = []
     last_sync_ts = 0
@@ -239,20 +677,14 @@ def build_status() -> dict:
         ts = int(last_by_name.get(name) or 0)
         if ts > last_sync_ts:
             last_sync_ts = ts
-        entry = {
-            "id": rid,
-            "name": name,
-            "state": str(repo.get("state") or ""),
-            "path": path,
-            "lastSyncTs": ts,
-            "error": str(repo.get("error") or ""),
-        }
+        entry = _repo_entry(rid, name, str(repo.get("state") or ""), path, ts, str(repo.get("error") or ""))
         if "progress" in repo:
             entry["progress"] = repo.get("progress")
         repos.append(entry)
 
-    # Libraries listed but missing from status (daemon down).
+    # Libraries listed but missing from status (daemon down, list still answered).
     if not repos and listed:
+        fallback_state = "daemon stopped" if probe.kind == "paused" else "unknown"
         for item in listed:
             if not isinstance(item, dict):
                 continue
@@ -261,61 +693,78 @@ def build_status() -> dict:
             if ts > last_sync_ts:
                 last_sync_ts = ts
             repos.append(
-                {
-                    "id": str(item.get("id") or ""),
-                    "name": name,
-                    "state": "daemon stopped" if not running else "unknown",
-                    "path": str(item.get("path") or ""),
-                    "lastSyncTs": ts,
-                    "error": "",
-                }
+                _repo_entry(
+                    str(item.get("id") or ""),
+                    name,
+                    fallback_state,
+                    str(item.get("path") or ""),
+                    ts,
+                )
             )
 
-    sync_errors = []
-    for err_item in status.get("sync_errors") or []:
-        if isinstance(err_item, dict):
-            sync_errors.append(
-                {
-                    "id": err_item.get("id"),
-                    "repoName": str(err_item.get("repo_name") or err_item.get("repoName") or ""),
-                    "path": str(err_item.get("path") or ""),
-                    "error": str(err_item.get("error") or err_item.get("err") or ""),
-                }
+    # Daemon is down and list failed: show libraries cached in repo.db.
+    if not repos and not running:
+        cached_state = {
+            "paused": "daemon stopped",
+            "unreachable": "unreachable",
+            "unknown": "unknown",
+        }.get(probe.kind, "daemon stopped")
+        for binding in bindings:
+            if binding["id"] in deleted_ids:
+                continue
+            name = str(binding.get("name") or "")
+            ts = int(last_by_name.get(name) or 0)
+            if ts > last_sync_ts:
+                last_sync_ts = ts
+            repos.append(
+                _repo_entry(
+                    str(binding.get("id") or ""),
+                    name,
+                    cached_state,
+                    str(binding.get("path") or ""),
+                    ts,
+                )
             )
 
-    if snoozed:
+    sync_errors = build_sync_errors(status.get("sync_errors") or [], repos, deleted_ids)
+
+    # Needs re-attach only when the daemon is up, reported no libraries, and
+    # repo.db still has a worktree binding. Empty repos after a deleted library,
+    # or a non-empty sync_errors list on its own, stay "No libraries".
+    needs_resync = running and not repos and has_leftover_worktree(bindings, deleted_ids)
+
+    if snoozed and probe.kind == "paused" and not running_despite:
         aggregate = "snoozed"
-        status_text = "Snoozed"
-    elif not running:
+    elif probe.kind == "unreachable":
+        aggregate = "unreachable"
+    elif probe.kind == "unknown":
+        aggregate = "unknown"
+    elif probe.kind == "paused":
         aggregate = "paused"
-        status_text = "Paused"
     elif not configured and not repos:
         aggregate = "setup"
-        status_text = "Not configured"
-    elif not repos and sync_errors:
-        # Library was dropped from the client (corrupt/resync) but errors remain.
+    elif needs_resync:
         aggregate = "needs-resync"
-        status_text = "Needs re-attach"
     elif not repos:
         aggregate = "idle"
-        status_text = "No libraries"
     else:
         aggregate = aggregate_state(repos)
-        status_text = {
-            "synchronized": "Synchronized",
-            "syncing": "Syncing",
-            "error": "Error",
-            "waiting": "Waiting",
-            "paused": "Paused",
-            "idle": "Idle",
-        }.get(aggregate, aggregate)
+
+    status_text = _status_text_for(aggregate)
+    if aggregate == "idle":
+        status_text = "No libraries"
 
     worktree = ""
     datadir = seafile_datadir()
     if datadir is not None:
         worktree = str(datadir.parent / "seafile")
 
-    active = running and not snoozed
+    active = running and (not snoozed or running_despite)
+    detail = ""
+    if running_despite and stop_detail:
+        detail = stop_detail[:200]
+    elif not running and probe.err:
+        detail = probe.err.strip()[:200]
 
     return {
         "ok": True,
@@ -326,6 +775,7 @@ def build_status() -> dict:
         "snoozed": snoozed,
         "snoozeUntil": int(state.get("snoozeUntil") or 0),
         "snoozeLabel": str(state.get("snoozeLabel") or ""),
+        "runningDespiteSnooze": running_despite,
         "aggregate": aggregate,
         "statusText": status_text,
         "lastSyncTs": last_sync_ts,
@@ -333,7 +783,7 @@ def build_status() -> dict:
         "syncErrors": sync_errors[:10],
         "logPath": str(LOG_PATH),
         "worktreeParent": worktree,
-        "detail": (err or "").strip()[:200] if not running and err else "",
+        "detail": detail,
     }
 
 
@@ -347,17 +797,16 @@ def cmd_sync_now() -> int:
         emit({"ok": False, "error": "seaf-cli not installed"})
         return 1
 
+    # Clear snooze before status so a sync request does not stop the daemon first.
+    if int(load_state().get("snoozeUntil") or 0) > 0:
+        clear_snooze_state()
+
     status = build_status()
-    if status.get("snoozed"):
-        state = load_state()
-        state.pop("snoozeUntil", None)
-        state.pop("snoozeLabel", None)
-        save_state(state)
 
     if not status.get("running"):
-        code, _, err = run(["seaf-cli", "start"], timeout=15)
-        if code != 0:
-            emit({"ok": False, "error": err.strip() or "failed to start seafile daemon"})
+        ok, err = start_daemon()
+        if not ok:
+            emit({"ok": False, "error": err or "failed to start seafile daemon"})
             return 1
         time.sleep(0.8)
 
@@ -368,7 +817,7 @@ def cmd_sync_now() -> int:
 
     repos = status.get("repos") or []
     if not repos:
-        # Refresh after start.
+        # Refresh after start. Skip another stop attempt; snooze was cleared.
         repos = build_status().get("repos") or []
 
     synced = 0
@@ -381,9 +830,10 @@ def cmd_sync_now() -> int:
             client.sync(rid, "")
             synced += 1
         except Exception as exc:  # noqa: BLE001 — surface to UI
-            errors.append(f"{repo.get('name') or rid}: {exc}")
+            errors.append("%s: %s" % (repo.get("name") or rid, exc))
 
-    emit({"ok": len(errors) == 0, "synced": synced, "errors": errors})
+    error_text = "; ".join(errors)
+    emit({"ok": len(errors) == 0, "synced": synced, "errors": errors, "error": error_text})
     return 0 if not errors else 1
 
 
@@ -391,22 +841,19 @@ def cmd_pause() -> int:
     if not which_seaf():
         emit({"ok": False, "error": "seaf-cli not installed"})
         return 1
-    code, _, err = run(["seaf-cli", "stop"], timeout=15)
-    emit({"ok": code == 0, "error": err.strip() if code else ""})
-    return 0 if code == 0 else 1
+    stopped, err = stop_daemon()
+    emit({"ok": stopped, "error": "" if stopped else err})
+    return 0 if stopped else 1
 
 
 def cmd_resume() -> int:
     if not which_seaf():
         emit({"ok": False, "error": "seaf-cli not installed"})
         return 1
-    state = load_state()
-    state.pop("snoozeUntil", None)
-    state.pop("snoozeLabel", None)
-    save_state(state)
-    code, _, err = run(["seaf-cli", "start"], timeout=15)
-    emit({"ok": code == 0, "error": err.strip() if code else ""})
-    return 0 if code == 0 else 1
+    clear_snooze_state()
+    ok, err = start_daemon()
+    emit({"ok": ok, "error": "" if ok else err})
+    return 0 if ok else 1
 
 
 def cmd_snooze(seconds: int, label: str) -> int:
@@ -416,21 +863,23 @@ def cmd_snooze(seconds: int, label: str) -> int:
     if not which_seaf():
         emit({"ok": False, "error": "seaf-cli not installed"})
         return 1
+    stopped, err = stop_daemon()
+    if not stopped:
+        # Do not leave a snooze window armed when the daemon is still up.
+        clear_snooze_state()
+        emit({"ok": False, "error": err or "Seafile daemon is still running after stop", "snoozeUntil": 0})
+        return 1
     until = int(time.time()) + seconds
     state = load_state()
     state["snoozeUntil"] = until
     state["snoozeLabel"] = label
     save_state(state)
-    code, _, err = run(["seaf-cli", "stop"], timeout=15)
-    emit({"ok": code == 0, "snoozeUntil": until, "error": err.strip() if code else ""})
-    return 0 if code == 0 else 1
+    emit({"ok": True, "snoozeUntil": until, "snoozeLabel": label, "error": ""})
+    return 0
 
 
 def cmd_clear_snooze() -> int:
-    state = load_state()
-    state.pop("snoozeUntil", None)
-    state.pop("snoozeLabel", None)
-    save_state(state)
+    clear_snooze_state()
     emit({"ok": True})
     return 0
 
@@ -465,7 +914,7 @@ def main(argv: list[str]) -> int:
             return 2
         return cmd_snooze(seconds, argv[3])
 
-    emit({"ok": False, "error": f"unknown command: {cmd}"})
+    emit({"ok": False, "error": "unknown command: %s" % cmd})
     return 2
 
 

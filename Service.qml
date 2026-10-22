@@ -1,12 +1,15 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Item {
   id: root
 
   property var settings: ({})
+  // Filesystem path or file URL of the plugin directory. Resolved below.
   property string pluginDir: ""
 
   property bool installed: false
@@ -15,32 +18,46 @@ Item {
   property bool snoozed: false
   property int snoozeUntil: 0
   property string snoozeLabel: ""
+  property bool runningDespiteSnooze: false
   property string aggregate: "missing"
+  // IPC status() reads this, so it stays the helper's English text.
   property string statusText: "Checking…"
   property int lastSyncTs: 0
   property var repos: []
   property var syncErrors: []
   property string logPath: ""
   property string worktreeParent: ""
+  property string detail: ""
   property string actionStatus: ""
   property string lastError: ""
   property bool refreshing: false
 
   // Optimistic pause/resume: -1 follow reality, 0 paused, 1 active.
   property int _desired: -1
+  property bool _pendingSync: false
   readonly property bool active: {
-    if (_desired === -1) return running && !snoozed
+    if (_desired === -1) return running && (!snoozed || runningDespiteSnooze)
     return _desired === 1
   }
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
   readonly property bool busy: statusProcess.running || controlProcess.running
-  readonly property string helperPath: pluginDir !== "" ? (pluginDir + "/helper.py") : ""
-  readonly property string setupPath: pluginDir !== "" ? (pluginDir + "/scripts/setup.sh") : ""
+  readonly property string pluginPath: Model.fileUrlToPath(pluginDir)
+  readonly property bool pluginPathAbsolute: pluginPath.length > 0 && pluginPath.charAt(0) === "/"
+  readonly property string helperPath: pluginPathAbsolute ? (pluginPath + "/helper.py") : ""
+  readonly property string setupPath: pluginPathAbsolute ? (pluginPath + "/scripts/setup.sh") : ""
+  // Set only after FileView confirms helper.py. A relative or missing path never runs.
+  property bool helperFileOk: false
+  readonly property bool helperReady: pluginPathAbsolute && helperPath !== "" && helperFileOk
 
   property string _statusOutput: ""
   property string _controlOutput: ""
   property string _controlError: ""
+
+  Commons.Translations {
+    id: strings
+    directory: root.pluginPathAbsolute ? root.pluginPath + "/i18n" : ""
+  }
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -60,18 +77,12 @@ Item {
     return value.length > 160 ? value.substring(0, 157) + "…" : value
   }
 
-  function fileUrlToPath(url) {
-    var s = String(url || "")
-    if (s.indexOf("file://") === 0) {
-      s = s.substring(7)
-      if (s.indexOf("//") === 0) s = s.substring(1)
-      try { return decodeURIComponent(s) } catch (e) { return s }
-    }
-    return s
+  function tr(key, fallback) {
+    return strings.t(key, fallback)
   }
 
   function refresh() {
-    if (statusProcess.running || helperPath === "") return
+    if (statusProcess.running || !helperReady) return
     _statusOutput = ""
     refreshing = true
     statusProcess.command = ["python3", helperPath, "status"]
@@ -81,7 +92,7 @@ Item {
   function applyStatus(raw) {
     var parsed = Model.parseStatus(raw)
     if (!parsed.ok) {
-      lastError = "Failed to read Seafile status"
+      lastError = tr("statusParseFailed", "Failed to read Seafile status")
       return
     }
     installed = parsed.installed === true
@@ -90,6 +101,7 @@ Item {
     snoozed = parsed.snoozed === true
     snoozeUntil = Number(parsed.snoozeUntil || 0)
     snoozeLabel = String(parsed.snoozeLabel || "")
+    runningDespiteSnooze = parsed.runningDespiteSnooze === true
     aggregate = String(parsed.aggregate || "")
     statusText = String(parsed.statusText || "")
     lastSyncTs = Number(parsed.lastSyncTs || 0)
@@ -97,12 +109,14 @@ Item {
     syncErrors = parsed.syncErrors || []
     logPath = String(parsed.logPath || "")
     worktreeParent = String(parsed.worktreeParent || "")
-    if (_desired !== -1 && active === (_desired === 1)) _desired = -1
+    detail = String(parsed.detail || "")
+    var realityActive = running && (!snoozed || runningDespiteSnooze)
+    if (_desired !== -1 && realityActive === (_desired === 1)) _desired = -1
     lastError = ""
   }
 
   function runHelper(args, desired) {
-    if (helperPath === "" || controlProcess.running) return
+    if (!helperReady || controlProcess.running) return
     if (desired !== undefined) _desired = desired
     _controlOutput = ""
     _controlError = ""
@@ -114,26 +128,28 @@ Item {
   function resume() { runHelper(["resume"], 1) }
 
   function toggleRunning() {
-    if (!installed || busy) return
+    if (!installed || busy || !helperReady) return
     if (active) pause()
     else resume()
   }
 
   function syncNow() {
-    if (!installed || busy) return
-    actionStatus = "Syncing…"
+    if (!installed || busy || !helperReady) return
+    actionStatusTimer.stop()
+    _pendingSync = true
+    actionStatus = tr("action.syncing", "Syncing…")
     runHelper(["sync-now"], 1)
   }
 
   function snooze(seconds, label) {
-    if (!installed || busy) return
-    actionStatus = "Snoozed"
+    if (!installed || busy || !helperReady) return
+    actionStatus = tr("action.snoozed", "Snoozed")
     actionStatusTimer.restart()
     runHelper(["snooze", String(seconds), String(label)], 0)
   }
 
   function installPackage() {
-    actionStatus = "Opening installer…"
+    actionStatus = tr("action.installing", "Opening installer…")
     actionStatusTimer.restart()
     Quickshell.execDetached([
       "omarchy-launch-floating-terminal-with-presentation",
@@ -144,7 +160,7 @@ Item {
 
   function runSetup() {
     if (setupPath === "") return
-    actionStatus = "Opening setup…"
+    actionStatus = tr("action.setup", "Opening setup…")
     actionStatusTimer.restart()
     Quickshell.execDetached([
       "omarchy-launch-floating-terminal-with-presentation",
@@ -158,18 +174,20 @@ Item {
   }
 
   function openFolder(path) {
+    var explicit = arguments.length > 0
     var target = String(path || "")
-    if (target === "" && repos.length > 0) target = String(repos[0].path || "")
-    if (target === "") return
+    if (target === "" && !explicit && repos.length > 0)
+      target = String(repos[0].path || "")
+    if (target.charAt(0) !== "/") return
     Quickshell.execDetached(["xdg-open", target])
   }
 
   function openLogs() {
     var path = String(logPath || "")
-    if (path === "") return
+    if (path.charAt(0) !== "/") return
     Quickshell.execDetached([
       "omarchy-launch-floating-terminal-with-presentation",
-      "less -R +G " + shellQuote(path)
+      "less +G " + shellQuote(path)
     ])
   }
 
@@ -177,7 +195,7 @@ Item {
     id: refreshTimer
     interval: root.refreshIntervalSec * 1000
     repeat: true
-    running: root.helperPath !== ""
+    running: root.helperReady
     triggeredOnStart: true
     onTriggered: root.refresh()
   }
@@ -187,7 +205,7 @@ Item {
     property int ticks: 0
     interval: 2000
     repeat: true
-    running: root.helperPath !== ""
+    running: root.helperReady
     onTriggered: {
       ticks += 1
       if ((root.running && root.configured) || ticks >= 15) startupRamp.running = false
@@ -199,7 +217,7 @@ Item {
     id: snoozeWatch
     interval: 30000
     repeat: true
-    running: root.snoozed
+    running: root.snoozed && root.helperReady
     onTriggered: root.refresh()
   }
 
@@ -234,6 +252,22 @@ Item {
     }
   }
 
+  FileView {
+    id: helperFile
+    path: root.helperPath
+    watchChanges: true
+    printErrors: false
+    onPathChanged: root.helperFileOk = false
+    onLoaded: {
+      var seen = String(path || "")
+      Qt.callLater(function() {
+        root.helperFileOk = seen !== "" && seen === root.helperPath
+      })
+    }
+    onLoadFailed: root.helperFileOk = false
+    onFileChanged: reload()
+  }
+
   Process {
     id: statusProcess
     running: false
@@ -248,7 +282,7 @@ Item {
       root.refreshing = false
       var stdout = String(statusStdout.text || root._statusOutput || "")
       if (exitCode === 0) root.applyStatus(stdout)
-      else root.lastError = root.elideStatus(stdout || "Failed to read Seafile status")
+      else root.lastError = root.elideStatus(stdout || root.tr("statusParseFailed", "Failed to read Seafile status"))
     }
   }
 
@@ -270,30 +304,30 @@ Item {
       var stdout = String(controlStdout.text || root._controlOutput || "")
       var stderr = String(controlStderr.text || root._controlError || "")
       var message = ""
+      var parsedOk = false
       try {
-        var parsed = JSON.parse(stdout)
-        if (parsed && parsed.error) message = String(parsed.error)
+        message = Model.controlMessage(JSON.parse(stdout))
+        parsedOk = true
       } catch (e) {
-        message = stderr || stdout
+        message = String(stderr || stdout || "").trim()
       }
-      if (exitCode !== 0) {
+      if (parsedOk && message === "" && exitCode !== 0)
+        message = String(stderr || "").trim()
+      var failed = parsedOk ? (exitCode !== 0 || message !== "") : (exitCode !== 0)
+      var wasSync = root._pendingSync
+      root._pendingSync = false
+      if (failed) {
+        root.actionStatusTimer.stop()
         root._desired = -1
-        root.lastError = root.elideStatus(message || "Something went wrong")
+        root.lastError = root.elideStatus(message || root.tr("action.failed", "Something went wrong"))
         root.actionStatus = root.lastError
       } else {
         root.lastError = ""
-        if (root.actionStatus === "Syncing…") root.actionStatus = ""
+        if (wasSync) root.actionStatus = ""
       }
       settleTimer.ticks = 0
       settleTimer.restart()
       delayedRefresh.restart()
-    }
-  }
-
-  onHelperPathChanged: {
-    if (helperPath !== "") {
-      refreshTimer.restart()
-      refresh()
     }
   }
 }
