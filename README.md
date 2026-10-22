@@ -6,6 +6,14 @@ It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze
 
 ---
 
+## Preview
+
+![Seafile for Omarchy](preview.png)
+
+![Panel](docs/preview-alts/05-panel-portrait.png)
+
+---
+
 ## Install
 
 ```bash
