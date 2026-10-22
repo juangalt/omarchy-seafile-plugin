@@ -57,6 +57,7 @@
   "checking": "Checking…",
   "action.syncing": "Syncing…",
   "action.syncRequested": "Sync requested…",
+  "action.synced": "Up to date",
   "action.nothingToSync": "No libraries to sync",
   "action.busy": "Busy…",
   "action.installing": "Opening installer…",

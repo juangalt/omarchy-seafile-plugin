@@ -30,6 +30,8 @@ Panel {
   property int libraryIndex: 0
   property bool cursorActive: false
   property bool moreOpen: false
+  // Ticking clock so relative "Just now" / snooze countdowns re-evaluate.
+  property double nowMs: Date.now()
 
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
@@ -55,6 +57,7 @@ Panel {
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && seafile.installed && seafile.configured
   readonly property string heroMetaText: {
     var _lang = strings.language
+    var _now = root.nowMs
     return Model.heroMeta({
       installed: seafile.installed,
       configured: seafile.configured,
@@ -67,7 +70,8 @@ Panel {
       lastSyncTs: seafile.lastSyncTs,
       aggregate: seafile.aggregate,
       syncErrors: seafile.syncErrors,
-      detail: seafile.detail
+      detail: seafile.detail,
+      nowMs: _now
     }, root.tr, Commons.I18n.formatNumber)
   }
 
@@ -239,7 +243,8 @@ Panel {
   }
 
   function runAction(action) {
-    if (!action || seafile.busy) return
+    if (!action) return
+    if (seafile.busy) { seafile.noteBusy(); return }
     switch (action.id) {
     case "sync": seafile.syncNow(); break
     case "folder": seafile.openFolder(); break
@@ -291,6 +296,16 @@ Panel {
     function onReposChanged() { root.ensureCursor() }
     function onInstalledChanged() { root.ensureCursor() }
     function onConfiguredChanged() { root.ensureCursor() }
+    function onSnoozedChanged() { root.ensureCursor() }
+  }
+
+  Timer {
+    id: heroClock
+    interval: 30000
+    repeat: true
+    running: root.opened || seafile.snoozed
+    triggeredOnStart: true
+    onTriggered: root.nowMs = Date.now()
   }
 
   Service {
@@ -437,7 +452,7 @@ Panel {
             visible: seafile.actionStatus !== "" || seafile.lastError !== ""
             width: parent.width
             text: seafile.actionStatus !== "" ? seafile.actionStatus : seafile.lastError
-            color: seafile.lastError !== "" && seafile.actionStatus === "" ? root.urgent : root.dim
+            color: seafile.lastError !== "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap

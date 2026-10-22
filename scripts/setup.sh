@@ -271,7 +271,7 @@ restart_seafile_daemon() {
 # requires exactly 40 hex chars. Auth login uses seafile-data/id as device_id —
 # keep config client_id and that file identical.
 ensure_client_id() {
-  local current file_id chosen cname
+  local current file_id chosen cname id_file_changed=0
   current=$("${SEAF[@]}" config -k client_id 2>/dev/null | sed -n 's/^client_id = //p' | tr -d '[:space:]')
   file_id=""
   if [[ -f ${DATA_DIR}/id ]]; then
@@ -290,10 +290,15 @@ ensure_client_id() {
   if [[ $file_id != "$chosen" ]]; then
     printf '%s\n' "$chosen" >"${DATA_DIR}/id"
     chmod 600 "${DATA_DIR}/id" 2>/dev/null || true
+    id_file_changed=1
     log "Wrote seafile-data/id to match client_id ${chosen:0:8}…"
   fi
 
   if [[ $current == "$chosen" ]]; then
+    # Auth readers may cache seafile-data/id — restart when only the file changed.
+    if ((id_file_changed)); then
+      restart_seafile_daemon
+    fi
     return 0
   fi
 
@@ -310,26 +315,16 @@ ensure_client_id() {
 }
 
 # seaf-cli sync/download return as soon as the clone task is queued. Wait until
-# the library appears in `list`, or fail with the real clone/log error.
+# the clone task finishes cleanly, or the library is listed AND synchronized.
+# Do not treat "already in list" alone as success — leftover bindings false-green.
 await_clone_success() {
   local repo_id=$1
   local timeout=${2:-180}
-  local deadline state err msg line
+  local deadline state err msg line ticks=0 repo_state listed
   deadline=$((SECONDS + timeout))
   echo "Waiting for library download to finish…"
   while ((SECONDS < deadline)); do
-    if "${SEAF[@]}" list --json 2>/dev/null | python3 -c '
-import json, sys
-rid = sys.argv[1]
-try:
-    repos = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-sys.exit(0 if any(str(r.get("id") or "") == rid for r in (repos or []) if isinstance(r, dict)) else 1)
-' "$repo_id"; then
-      log "Clone finished: library $repo_id is listed locally"
-      return 0
-    fi
+    ticks=$((ticks + 1))
     # Inspect clone task state via RPC (tab-separated: state may contain spaces).
     IFS=$'\t' read -r state err < <(python3 - "$repo_id" "$DATA_DIR" <<'PY' || true
 import sys
@@ -360,8 +355,12 @@ PY
     err=${err:-0}
     case "$state" in
     done | success | finished)
-      log "Clone task state=$state for $repo_id"
-      return 0
+      # 0 = OK, 29 = SYNC_ERROR_ID_NO_ERROR. Any other code is a real failure.
+      if [[ $err == 0 || $err == 29 ]]; then
+        log "Clone task state=$state error=$err for $repo_id"
+        return 0
+      fi
+      fail "Clone finished with error=$err (state=$state). See ${CONF_DIR}/logs/seafile.log"
       ;;
     error | canceled | cancelled)
       msg="Clone failed (state=$state"
@@ -372,7 +371,6 @@ PY
       line=$(grep -E "${repo_id}|${repo_id:0:8}|permission denied|Bad response code" \
         "${CONF_DIR}/logs/seafile.log" 2>/dev/null | tail -8 || true)
       if grep -qi 'permission denied\|Bad response code.*400' <<<"$line"; then
-        # Prefer the permission-check URL from this failure (not old log lines).
         if grep -qoE 'client_id=[0-9a-fA-F]*&' <<<"$line"; then
           local bad_cid
           bad_cid=$(grep -oE 'client_id=[0-9a-fA-F]*&' <<<"$line" | tail -1 | sed 's/^client_id=//;s/&$//')
@@ -392,6 +390,53 @@ PY
       fail "$msg"
       ;;
     esac
+
+    listed=0
+    if "${SEAF[@]}" list --json 2>/dev/null | python3 -c '
+import json, sys
+rid = sys.argv[1]
+try:
+    repos = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(str(r.get("id") or "") == rid for r in (repos or []) if isinstance(r, dict)) else 1)
+' "$repo_id"; then
+      listed=1
+    fi
+
+    if ((listed)); then
+      repo_state=$(
+        "${SEAF[@]}" status --json 2>/dev/null | python3 -c '
+import json, sys
+rid = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("")
+    raise SystemExit(0)
+repos = data.get("repos") if isinstance(data, dict) else data
+for r in repos or []:
+    if isinstance(r, dict) and str(r.get("id") or "") == rid:
+        print(str(r.get("state") or ""))
+        break
+' "$repo_id" 2>/dev/null || true
+      )
+      case "$repo_state" in
+      synchronized)
+        log "Clone finished: library $repo_id listed and synchronized"
+        return 0
+        ;;
+      error)
+        fail "Library $repo_id is listed but in error state. See ${CONF_DIR}/logs/seafile.log"
+        ;;
+      esac
+      # Listed, no active clone task — give the daemon a few seconds before accepting
+      # a leftover binding that was already present before this sync/download.
+      if [[ $state == none ]] && ((ticks >= 3)); then
+        log "Clone finished: library $repo_id listed (no clone task after ${ticks}s)"
+        return 0
+      fi
+    fi
     sleep 1
   done
   fail "Timed out waiting for library $repo_id to finish downloading. See ${CONF_DIR}/logs/seafile.log"
@@ -411,13 +456,14 @@ from pathlib import Path
 repo_id, datadir = sys.argv[1], Path(sys.argv[2])
 sock = datadir / "seafile.sock"
 if not sock.exists():
-    sys.exit(0)
+    print("clear_clone_tasks: seafile.sock missing")
+    sys.exit(1)
 try:
     from seafile.rpcclient import SeafileRpcClient
     client = SeafileRpcClient(str(sock))
 except Exception as exc:
     print("clear_clone_tasks: rpc unavailable:", exc)
-    sys.exit(0)
+    sys.exit(1)
 
 def states():
     out = []
@@ -436,16 +482,17 @@ if before:
         print("cancel failed:", exc)
 after = states()
 print("clear_clone_tasks: after", after)
-# Stick around as canceled/error/fetch → ask caller to restart.
-need_restart = any(s not in ("", "done", "canceled", "cancelled", "success") for s in after) or any(
-    s in ("canceled", "cancelled", "error") for s in after
+# canceled/error/fetch stick; done also sticks (cancel returns -1) — restart.
+need_restart = bool(after) and (
+    any(s in ("canceled", "cancelled", "error", "done", "fetch") for s in after)
+    or any(s not in ("", "canceled", "cancelled", "success", "done") for s in after)
 )
-sys.exit(2 if need_restart and after else 0)
+sys.exit(2 if need_restart else 0)
 PY
   rc=$?
   set -e
-  if ((rc == 2)); then
-    log "Restarting seafile daemon to clear stuck clone task for $repo_id"
+  if ((rc == 1 || rc == 2)); then
+    log "Restarting seafile daemon to clear stuck clone task for $repo_id (rc=$rc)"
     restart_seafile_daemon
   fi
 }

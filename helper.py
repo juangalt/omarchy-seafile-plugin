@@ -24,7 +24,7 @@ STATE_PATH = STATE_DIR / "state.json"
 LOG_PATH = CONF_DIR / "logs" / "seafile.log"
 SEAF_UNIT = "seaf-daemon.service"
 SYNC_LINE = re.compile(
-    r"Repo '([^']+)' sync state transition from '.*' to 'synchronized'"
+    r"Repo '([^']+)' sync state transition from '?[^']*'? to '?synchronized'?"
 )
 TS_LINE = re.compile(r"^\[(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\]")
 _NAME_KEYS = ("sync-worktree-name", "origin-repo-name", "repo-name", "name")
@@ -480,10 +480,12 @@ def enrich_unknown_error(repo_id: str, repo_name: str, error: str) -> str:
         ):
             relevant.append(line)
     blob = "\n".join(relevant[-12:])
-    m = re.search(r"client_id=([0-9a-fA-F]*)&", blob)
-    if m is not None and m.group(1) == "":
+    # Prefer the most recent client_id= in the window (search finds the first).
+    ids = re.findall(r"client_id=([0-9a-fA-F]*)&", blob)
+    latest_cid = ids[-1] if ids else None
+    if latest_cid is not None and latest_cid == "":
         return "Server rejected download (empty client id) — open Connect / repair"
-    if m is not None and len(m.group(1)) != 40:
+    if latest_cid is not None and len(latest_cid) != 40:
         return "Server rejected download (client id must be 40 hex chars) — open Connect / repair"
     if re.search(r"Download permission denied|permission-check.*400|Bad response code.*400", blob):
         return "Download permission denied by server — open Connect / repair"
@@ -705,14 +707,9 @@ def build_status() -> dict:
         time.sleep(0.4)
         probe = probe_status()
 
-    running_despite = False
-    stop_detail = ""
-    if snoozed and probe.kind != "paused":
-        stopped, stop_detail = stop_daemon()
-        if stopped:
-            probe = probe_status()
-        else:
-            running_despite = True
+    # Status never stops the daemon. Snooze/pause commands own stop; reporting
+    # runningDespiteSnooze avoids racing sync-now/resume that just started it.
+    running_despite = bool(snoozed and probe.kind != "paused")
 
     running = probe.kind == "running"
     status = parse_status_json(probe.out) if running else {"repos": [], "sync_errors": []}
@@ -730,8 +727,12 @@ def build_status() -> dict:
 
     bindings, deleted_ids = read_repo_db()
     last_by_name = last_sync_from_log()
+    # sync-now often returns to synchronized without a log line; pendingSyncTs
+    # keeps "last synced" honest until the next logged transition.
+    pending_sync_ts = int(state.get("pendingSyncTs") or 0)
     repos = []
     last_sync_ts = 0
+    any_sync_error = False
     for repo in status.get("repos") or []:
         if not isinstance(repo, dict):
             continue
@@ -740,15 +741,28 @@ def build_status() -> dict:
         meta = by_id.get(rid) or {}
         path = str(meta.get("path") or "")
         ts = int(last_by_name.get(name) or 0)
+        repo_state = str(repo.get("state") or "")
+        if repo_state == "error":
+            any_sync_error = True
+        if repo_state == "synchronized" and pending_sync_ts > ts:
+            ts = pending_sync_ts
         if ts > last_sync_ts:
             last_sync_ts = ts
-        repo_state = str(repo.get("state") or "")
         raw_err = str(repo.get("error") or "")
         err = "" if repo_state == "synchronized" else enrich_unknown_error(rid, name, raw_err)
         entry = _repo_entry(rid, name, repo_state, path, ts, err)
         if "progress" in repo:
             entry["progress"] = repo.get("progress")
         repos.append(entry)
+
+    # Keep pending while it still beats the log so no-op syncs stay fresh.
+    # Clear when the log catches up, a library errors, or the daemon is paused.
+    if pending_sync_ts > 0:
+        log_max = max(last_by_name.values()) if last_by_name else 0
+        if any_sync_error or probe.kind == "paused" or log_max >= pending_sync_ts:
+            state = dict(state)
+            state.pop("pendingSyncTs", None)
+            save_state(state)
 
     # Libraries listed but missing from status (daemon down, list still answered).
     if not repos and listed:
@@ -829,9 +843,7 @@ def build_status() -> dict:
 
     active = running and (not snoozed or running_despite)
     detail = ""
-    if running_despite and stop_detail:
-        detail = stop_detail[:200]
-    elif not running and probe.err:
+    if not running and probe.err:
         detail = probe.err.strip()[:200]
 
     return {
@@ -921,6 +933,11 @@ def cmd_sync_now() -> int:
             errors.append("%s: %s" % (repo.get("name") or rid, exc))
 
     error_text = "; ".join(errors)
+    if synced > 0 and not errors:
+        # Seafile often skips logging "to synchronized" on no-op syncs.
+        sync_state = load_state()
+        sync_state["pendingSyncTs"] = int(time.time())
+        save_state(sync_state)
     # "synced" means RPC accepted the request, not that transfer finished.
     emit({
         "ok": len(errors) == 0,
@@ -937,6 +954,10 @@ def cmd_pause() -> int:
         emit({"ok": False, "error": "seaf-cli not installed"})
         return 1
     stopped, err = stop_daemon()
+    if stopped:
+        state = load_state()
+        if state.pop("pendingSyncTs", None) is not None:
+            save_state(state)
     emit({"ok": stopped, "error": "" if stopped else err})
     return 0 if stopped else 1
 

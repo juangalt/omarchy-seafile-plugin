@@ -104,16 +104,17 @@ function heroMeta(status, tr, fmt) {
   if (!status) return ""
   var t = translator(tr)
   var f = formatter(fmt)
+  var nowMs = status.nowMs
 
   if (status.runningDespiteSnooze) {
-    var leftDespite = minutesLeft(status.snoozeUntil, undefined, f)
+    var leftDespite = minutesLeft(status.snoozeUntil, nowMs, f)
     if (leftDespite !== "")
       return t("meta.runningDespiteSnoozeLeft", "Sync still running · %1m left").replace("%1", leftDespite)
     return t("meta.runningDespiteSnooze", "Sync still running")
   }
 
   if (status.snoozed) {
-    var left = minutesLeft(status.snoozeUntil, undefined, f)
+    var left = minutesLeft(status.snoozeUntil, nowMs, f)
     var label = clip(status.snoozeLabel, 40)
     if (left !== "") {
       if (label !== "") {
@@ -153,7 +154,7 @@ function heroMeta(status, tr, fmt) {
   if (!status.active || aggregate === "paused") return t("meta.paused", "Syncing paused")
   if (aggregate === "idle") return t("meta.idle", "No libraries")
   if (aggregate === "synchronized") {
-    var rel = relativeTime(status.lastSyncTs, undefined, t, f)
+    var rel = relativeTime(status.lastSyncTs, nowMs, t, f)
     if (rel !== "") return t("meta.synchronizedAgo", "Synchronized · %1").replace("%1", rel)
     return t("meta.synchronized", "Synchronized")
   }
