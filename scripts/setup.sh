@@ -24,7 +24,9 @@ ensure_log() {
 }
 
 log() {
-  printf '%s\n' "$*" | tee -a "$LOG_FILE" >/dev/null
+  # Never tee secrets to the terminal via this helper for command lines —
+  # callers should pass already-redacted text.
+  printf '%s\n' "$*" >>"$LOG_FILE"
   printf '%s\n' "$*" >&2
 }
 
@@ -37,6 +39,33 @@ fail() {
   echo "  $LOG_FILE" >&2
   echo "Open that file if you need the full command output." >&2
   exit 1
+}
+
+# Redact -p / -T / --password / --token values before anything hits the log.
+redact_cmd() {
+  local out=()
+  local skip_next=0
+  local arg
+  for arg in "$@"; do
+    if ((skip_next)); then
+      out+=("'***'")
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+    -p | --password | -T | --token | -a | --tfa | -e | --libpasswd)
+      out+=("$arg")
+      skip_next=1
+      ;;
+    -p* | --password=* | -T* | --token=* | -a* | --tfa=* | -e* | --libpasswd=*)
+      out+=("${arg%%=*}='***'")
+      ;;
+    *)
+      out+=("$arg")
+      ;;
+    esac
+  done
+  printf '%s' "${out[*]}"
 }
 
 # seaf-cli requires a scheme. Accept host[:port]/path] and add https://.
@@ -72,9 +101,10 @@ validate_server_url() {
 }
 
 is_auth_error() {
-  # Match real HTTP auth failures. Do NOT match bare "timeout" — Python
-  # tracebacks contain the parameter name `timeout` on every urlopen() line.
-  grep -qiE 'HTTP Error 401|HTTP Error 403|HTTPError: HTTP Error 40[13]|incorrect email or password|wrong password|invalid token' <<<"$1"
+  # Seafile often returns HTTP 400 with "Unable to login with provided credentials"
+  # for a bad password (not 401). Do NOT match bare "timeout" — Python urlopen
+  # tracebacks contain that parameter name on every failure.
+  grep -qiE 'HTTP Error 401|HTTP Error 403|HTTP Error 400|HTTPError: HTTP Error 40[013]|Unable to login with provided credentials|incorrect email or password|wrong password|invalid token|non_field_errors' <<<"$1"
 }
 
 # Map noisy seaf-cli / urllib failures to one actionable sentence.
@@ -86,12 +116,13 @@ explain_seaf_error() {
     echo "Server URL is missing http:// or https://. Example: https://seafile.example.com"
     return
   fi
-  # Auth before connectivity: tracebacks include the word "timeout" as a kwarg.
   if is_auth_error "$output"; then
     if grep -qiE 'HTTP Error 401|invalid token' <<<"$output"; then
       echo "Saved login token was rejected (401). Sign in again with your password."
+    elif grep -qiE 'Unable to login|HTTP Error 400|non_field_errors' <<<"$output"; then
+      echo "Username/password rejected by the server. Check credentials, and enable 2FA in the next prompt if your account uses it."
     else
-      echo "Login failed (403/credentials). Check username, password, and 2FA."
+      echo "Login failed. Check username, password, and 2FA."
     fi
     return
   fi
@@ -116,7 +147,6 @@ explain_seaf_error() {
     return
   fi
 
-  # Fall back: last non-traceback line that looks useful
   local line
   line=$(grep -vE '^(Traceback|File "|  File |    )' <<<"$output" | grep -v '^[[:space:]]*$' | tail -1 || true)
   if [[ -n ${line:-} ]]; then
@@ -127,7 +157,7 @@ explain_seaf_error() {
 }
 
 # Runs a command; on failure sets SEAF_RC / SEAF_OUT and returns non-zero
-# without exiting. Logs always.
+# without exiting. Logs a redacted command line always.
 run_seaf_capture() {
   local label=$1
   shift
@@ -136,15 +166,15 @@ run_seaf_capture() {
   SEAF_RC=$?
   set -e
   {
-    echo "\$ $*   # $label"
-    echo "$SEAF_OUT"
+    echo "\$ $(redact_cmd "$@")   # $label"
+    # Redact any accidental secret echoes from child output (unlikely).
+    echo "$SEAF_OUT" | sed -E 's/(token["'\'']?\s*[:=]\s*)[^[:space:]"',:}]+/\1***/Ig'
     echo "(exit $SEAF_RC)"
   } >>"$LOG_FILE"
   return "$SEAF_RC"
 }
 
 run_seaf() {
-  # usage: run_seaf <label> <command...>
   local label=$1
   shift
   if ! run_seaf_capture "$label" "$@"; then
@@ -153,8 +183,102 @@ run_seaf() {
   printf '%s\n' "$SEAF_OUT"
 }
 
+# POST /api2/auth-token/ ourselves so we can show Seafile's JSON error body
+# and avoid putting the password on a logged seaf-cli argv.
+# Sets AUTH_TOKEN on success.
+obtain_token_checked() {
+  local server=$1 username=$2 password=$3 tfa=${4:-}
+  local out rc
+  set +e
+  out=$(
+    SERVER="$server" USERNAME="$username" PASSWORD="$password" TFA="$tfa" DATADIR="$DATA_DIR" python3 - <<'PY'
+import json, os, sys, urllib.error, urllib.parse, urllib.request, secrets
+
+server = os.environ["SERVER"].rstrip("/")
+username = os.environ["USERNAME"]
+password = os.environ["PASSWORD"]
+tfa = os.environ.get("TFA") or ""
+datadir = os.environ.get("DATADIR") or ""
+
+idfile = os.path.join(datadir, "id")
+device_id = ""
+if datadir and os.path.isfile(idfile):
+    device_id = open(idfile, encoding="utf-8").read().strip()
+if not device_id:
+    device_id = secrets.token_hex(20)
+    if datadir:
+        os.makedirs(datadir, exist_ok=True)
+        with open(idfile, "w", encoding="utf-8") as fh:
+            fh.write(device_id)
+
+data = urllib.parse.urlencode({
+    "username": username,
+    "password": password,
+    "platform": "linux",
+    "device_id": device_id,
+    "device_name": "terminal-" + os.uname().nodename[:25],
+    "client_version": "9.0.0",
+    "platform_version": "",
+}).encode("utf-8")
+
+headers = {"Content-Type": "application/x-www-form-urlencoded"}
+if tfa:
+    headers["X-SEAFILE-OTP"] = tfa
+
+req = urllib.request.Request(server + "/api2/auth-token/", data=data, headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+        payload = json.loads(body)
+        token = payload.get("token")
+        if not token:
+            print("ERROR\tServer response had no token field.")
+            sys.exit(2)
+        print("OK\t" + token)
+except urllib.error.HTTPError as exc:
+    raw = exc.read().decode("utf-8", errors="replace")
+    detail = raw.strip() or str(exc.reason)
+    try:
+        parsed = json.loads(raw)
+        errs = parsed.get("non_field_errors") or parsed.get("detail") or parsed
+        if isinstance(errs, list):
+            detail = "; ".join(str(x) for x in errs)
+        else:
+            detail = str(errs)
+    except Exception:
+        pass
+    print(f"ERROR\tHTTP {exc.code}: {detail}")
+    sys.exit(1)
+except Exception as exc:
+    print(f"ERROR\t{exc}")
+    sys.exit(1)
+PY
+  )
+  rc=$?
+  set -e
+  {
+    echo "\$ auth-token POST $server  # login check"
+    # never log token
+    if [[ $out == OK$'\t'* ]]; then
+      echo "OK (token acquired)"
+    else
+      echo "$out"
+    fi
+    echo "(exit $rc)"
+  } >>"$LOG_FILE"
+
+  if ((rc != 0)) || [[ $out != OK$'\t'* ]]; then
+    local detail=${out#ERROR$'\t'}
+    if [[ $detail == *"Unable to login"* ]]; then
+      fail "Login rejected: wrong username/password${tfa:+, or bad 2FA code}. Server said: Unable to login with provided credentials."
+    fi
+    fail "Login failed: ${detail:-unknown error}"
+  fi
+  AUTH_TOKEN=${out#OK$'\t'}
+  [[ -n $AUTH_TOKEN ]] || fail "Login returned an empty token."
+}
+
 read_existing_binding() {
-  # Prints: repo_id|email|server|worktree|token  or nothing
   [[ -f $REPO_DB ]] || return 0
   command -v sqlite3 >/dev/null 2>&1 || return 0
   sqlite3 "$REPO_DB" "
@@ -167,6 +291,39 @@ read_existing_binding() {
     FROM Repo r
     LIMIT 1;
   " 2>/dev/null || true
+}
+
+prompt_login() {
+  # Sets: server username AUTH_TOKEN (and uses password ephemerally)
+  local default_server=$1 default_user=$2
+  local raw_server password tfa
+
+  raw_server=$(gum input --value "$default_server" --placeholder "https://seafile.example.com" --prompt "Server URL> ")
+  [[ -n $raw_server ]] || fail "Server URL required."
+  server=$(normalize_server_url "$raw_server")
+  if [[ $server != "$raw_server" ]]; then
+    echo "Using server URL: $server"
+    log "Normalized server URL: '$raw_server' -> '$server'"
+  fi
+  if ! msg=$(validate_server_url "$server"); then
+    fail "$msg"
+  fi
+
+  username=$(gum input --value "$default_user" --placeholder "you@example.com" --prompt "Username> ")
+  [[ -n $username ]] || fail "Username required."
+
+  password=$(gum input --password --placeholder "password" --prompt "Password> ")
+  [[ -n $password ]] || fail "Password required."
+
+  tfa=""
+  if gum confirm "This account uses two-factor authentication (2FA)?"; then
+    tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
+    [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
+  fi
+
+  echo "Signing in to $server …"
+  obtain_token_checked "$server" "$username" "$password" "$tfa"
+  # password goes out of scope when function returns; do not export it
 }
 
 need seaf-cli
@@ -212,8 +369,10 @@ if [[ -n ${existing:-} ]]; then
   log "Found leftover binding id=$existing_id email=$existing_email server=$existing_server worktree=$existing_worktree"
 fi
 
-# Prefer repairing the known vault binding without a full re-login when possible.
-repair_failed_auth=0
+server=""
+username=""
+AUTH_TOKEN=""
+
 if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $existing_email ]]; then
   echo "Found a previous library binding that is no longer active:"
   echo "  Library : $existing_id"
@@ -222,6 +381,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
   echo "  Account : $existing_email"
   echo
   if gum confirm "Try to re-attach that library?"; then
+    repair_mode=1
     raw_server=$(gum input --value "$existing_server" \
       --placeholder "https://seafile.example.com" \
       --prompt "Server URL (edit if the saved one is wrong)> ")
@@ -234,13 +394,14 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
       fail "$msg"
     fi
     mkdir -p "$existing_worktree"
+    username=$existing_email
 
     if [[ -n $existing_token ]]; then
       echo "Re-attaching with saved token → $existing_worktree"
       if run_seaf_capture "Re-attach library (token)" seaf-cli sync \
         -l "$existing_id" \
         -s "$server" \
-        -u "$existing_email" \
+        -u "$username" \
         -T "$existing_token" \
         -d "$existing_worktree"; then
         echo
@@ -254,74 +415,47 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
       why=$(explain_seaf_error "$SEAF_OUT" "$server")
       echo "✗ Token re-attach failed: $why"
       log "Token re-attach failed: $why"
-      if is_auth_error "$SEAF_OUT"; then
-        echo "The saved token is no longer valid. Continuing with a password login for the same library…"
-        repair_failed_auth=1
-      else
-        if ! gum confirm "Try signing in with a password for the same library?"; then
-          fail "Re-attach aborted. $why"
-        fi
-        repair_failed_auth=1
-      fi
+      echo "Continuing with a password login for the same library…"
     else
       echo "No saved token — need a password login for this library."
-      repair_failed_auth=1
     fi
-  else
-    echo "Continuing with a fresh login…"
+
+    password=$(gum input --password --placeholder "password" --prompt "Password> ")
+    [[ -n $password ]] || fail "Password required."
+    tfa=""
+    if gum confirm "This account uses two-factor authentication (2FA)?"; then
+      tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
+      [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
+    fi
+    echo "Signing in to $server …"
+    obtain_token_checked "$server" "$username" "$password" "$tfa"
+    unset password
+    echo "Syncing ${existing_id} → ${existing_worktree}"
+    run_seaf "Sync library" seaf-cli sync \
+      -l "$existing_id" \
+      -s "$server" \
+      -u "$username" \
+      -T "$AUTH_TOKEN" \
+      -d "$existing_worktree" >/dev/null
+    echo
+    echo "Libraries:"
+    seaf-cli list || true
+    echo
+    echo "Setup complete (re-attached with fresh login)."
+    log "Repair sync succeeded (password→token)"
+    exit 0
   fi
+  echo "Continuing with a fresh login…"
   echo
 fi
 
-# If token repair failed auth, keep the chosen server + force sync of that library.
-if ((repair_failed_auth)); then
-  default_server=${server:-$existing_server}
-else
-  default_server=${existing_server:-https://}
-fi
-default_user=${existing_email:-}
-default_folder=${existing_worktree:-$HOME/}
+prompt_login "${existing_server:-https://}" "${existing_email:-}"
 
-raw_server=$(gum input --value "$default_server" --placeholder "https://seafile.example.com" --prompt "Server URL> ")
-[[ -n $raw_server ]] || fail "Server URL required."
+echo
+echo "Fetching remote libraries from $server …"
+remote_json=$(run_seaf "List remote libraries" seaf-cli list-remote -s "$server" -u "$username" -T "$AUTH_TOKEN" --json)
 
-server=$(normalize_server_url "$raw_server")
-if [[ $server != "$raw_server" ]]; then
-  echo "Using server URL: $server"
-  log "Normalized server URL: '$raw_server' -> '$server'"
-fi
-if ! msg=$(validate_server_url "$server"); then
-  fail "$msg"
-fi
-
-username=$(gum input --value "$default_user" --placeholder "you@example.com" --prompt "Username> ")
-[[ -n $username ]] || fail "Username required."
-
-password=$(gum input --password --placeholder "password" --prompt "Password> ")
-[[ -n $password ]] || fail "Password required."
-
-tfa=""
-if gum confirm "Use two-factor authentication code?"; then
-  tfa=$(gum input --placeholder "123456" --prompt "TFA> ")
-fi
-
-sync_args_base=(-s "$server" -u "$username" -p "$password")
-[[ -n $tfa ]] && sync_args_base+=(-a "$tfa")
-
-# Password repair of a known unbound library — skip the remote picker.
-if ((repair_failed_auth)) && [[ -n $existing_id && -n $existing_worktree ]]; then
-  folder=$existing_worktree
-  lib_id=$existing_id
-  lib_name="obsidian-vault"
-  mkdir -p "$folder"
-  echo "Signing in and syncing ${lib_id} → ${folder}"
-  run_seaf "Sync library" seaf-cli sync -l "$lib_id" "${sync_args_base[@]}" -d "$folder" >/dev/null
-else
-  echo
-  echo "Fetching remote libraries from $server …"
-  remote_json=$(run_seaf "List remote libraries" seaf-cli list-remote "${sync_args_base[@]}" --json)
-
-  mapfile -t choices < <(printf '%s\n' "$remote_json" | python3 -c '
+mapfile -t choices < <(printf '%s\n' "$remote_json" | python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
 try:
@@ -341,38 +475,38 @@ for r in repos:
         print(f"{name}\t{rid}")
 ' 2>>"$LOG_FILE") || fail "Remote library list was not valid JSON. See $LOG_FILE"
 
-  if ((${#choices[@]} == 0)); then
-    fail "No remote libraries found for this account on $server."
-  fi
+if ((${#choices[@]} == 0)); then
+  fail "No remote libraries found for this account on $server."
+fi
 
-  picked=$(printf '%s\n' "${choices[@]}" | gum choose --header "Pick a library to sync")
-  [[ -n $picked ]] || fail "No library selected."
-  lib_name=${picked%%$'\t'*}
-  lib_id=${picked#*$'\t'}
+picked=$(printf '%s\n' "${choices[@]}" | gum choose --header "Pick a library to sync")
+[[ -n $picked ]] || fail "No library selected."
+lib_name=${picked%%$'\t'*}
+lib_id=${picked#*$'\t'}
 
-  if [[ -n $existing_worktree && $lib_id == "$existing_id" ]]; then
-    default_folder=$existing_worktree
-  elif [[ -z $existing_worktree || $default_folder == "$HOME/" ]]; then
-    default_folder="${HOME}/$(echo "$lib_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
-  fi
+default_folder=${existing_worktree:-}
+if [[ -n $existing_worktree && $lib_id == "$existing_id" ]]; then
+  default_folder=$existing_worktree
+elif [[ -z $default_folder ]]; then
+  default_folder="${HOME}/$(echo "$lib_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
+fi
 
-  folder=$(gum input --value "$default_folder" --prompt "Local folder> ")
-  [[ -n $folder ]] || fail "Folder required."
+folder=$(gum input --value "$default_folder" --prompt "Local folder> ")
+[[ -n $folder ]] || fail "Folder required."
 
-  mode=$(gum choose --header "How should this library land locally?" \
-    "Sync into existing/empty folder (keeps local files)" \
-    "Download into a parent directory (Seafile creates the library folder)")
+mode=$(gum choose --header "How should this library land locally?" \
+  "Sync into existing/empty folder (keeps local files)" \
+  "Download into a parent directory (Seafile creates the library folder)")
 
-  if [[ $mode == Sync* ]]; then
-    mkdir -p "$folder"
-    echo "Syncing ${lib_name} → ${folder}"
-    run_seaf "Sync library" seaf-cli sync -l "$lib_id" "${sync_args_base[@]}" -d "$folder" >/dev/null
-  else
-    parent=$(dirname "$folder")
-    mkdir -p "$parent"
-    echo "Downloading ${lib_name} under ${parent}"
-    run_seaf "Download library" seaf-cli download -l "$lib_id" "${sync_args_base[@]}" -d "$parent" >/dev/null
-  fi
+if [[ $mode == Sync* ]]; then
+  mkdir -p "$folder"
+  echo "Syncing ${lib_name} → ${folder}"
+  run_seaf "Sync library" seaf-cli sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder" >/dev/null
+else
+  parent=$(dirname "$folder")
+  mkdir -p "$parent"
+  echo "Downloading ${lib_name} under ${parent}"
+  run_seaf "Download library" seaf-cli download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent" >/dev/null
 fi
 
 echo
