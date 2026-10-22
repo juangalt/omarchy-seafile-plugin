@@ -295,7 +295,7 @@ def start_daemon() -> tuple[bool, str]:
     if not which_seaf():
         return False, unit_err or "seaf-cli not installed"
     code, _out, err = run(["seaf-cli", "start"], timeout=15)
-    if code == 0 or _wait_until_up(1.0):
+    if _wait_until_up(8.0 if code == 0 else 1.0):
         return True, ""
     return False, (err or "").strip() or unit_err or "failed to start seafile daemon"
 
@@ -860,15 +860,23 @@ def cmd_status() -> int:
 
 
 def _rpc_sync(client, repo_id: str, timeout: float = 20.0) -> None:
-    """Call seafile RPC sync with a hard timeout so control never hangs forever."""
+    """Call seafile RPC sync with a hard timeout so control never hangs forever.
+
+    Do not use ThreadPoolExecutor as a context manager: on timeout its
+    ``shutdown(wait=True)`` would block until the hung RPC finishes.
+    """
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
         fut = pool.submit(client.sync, repo_id, "")
         try:
             fut.result(timeout=timeout)
         except FuturesTimeout as exc:
+            fut.cancel()
             raise TimeoutError("seafile sync RPC timed out after %.0fs" % timeout) from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def cmd_sync_now() -> int:

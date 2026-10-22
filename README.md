@@ -39,10 +39,12 @@ Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `http
 
 ## How Connect works
 
-1. Signs in and lists remote libraries.
-2. Ensures a valid **40-character hex** `client_id` (Seafile rejects anything else on download permission-check), kept in sync with `~/.seafile-client/seafile-data/id`.
+1. Starts the daemon if needed and ensures a valid **40-character hex** `client_id` (Seafile rejects anything else on download permission-check), kept in sync with `~/.seafile-client/seafile-data/id`.
+2. Signs in and lists remote libraries (or offers to re-attach a leftover binding).
 3. Queues `seaf-cli sync` / `download`, clears stuck clone tasks if needed.
 4. **Waits until the library actually appears locally** before declaring success — `seaf-cli` alone only queues the clone.
+
+If `seaf-cli` was initialized earlier but no library is linked yet, the bar may already look “configured.” Use **More → Connect / repair** to finish binding.
 
 Setup log (mode `600`):
 

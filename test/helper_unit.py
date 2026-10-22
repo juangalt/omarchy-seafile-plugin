@@ -64,6 +64,19 @@ class HelperUnit(unittest.TestCase):
             "Permission denied",
         )
 
+    def test_rpc_sync_timeout_returns(self):
+        import time
+
+        class Slow:
+            def sync(self, repo_id, path):
+                time.sleep(5)
+
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            helper._rpc_sync(Slow(), "repo", timeout=0.3)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0, "timeout must not wait for the hung RPC")
+
 
 if __name__ == "__main__":
     unittest.main()

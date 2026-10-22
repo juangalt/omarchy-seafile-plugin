@@ -401,8 +401,10 @@ PY
 # "Task is already in progress"). Restart the daemon if a canceled task sticks.
 clear_clone_tasks_for() {
   local repo_id=$1
+  local rc=0
   [[ -n $repo_id ]] || return 0
-  python3 - "$repo_id" "$DATA_DIR" <<'PY' >>"$LOG_FILE" 2>&1 || true
+  set +e
+  python3 - "$repo_id" "$DATA_DIR" <<'PY' >>"$LOG_FILE" 2>&1
 import sys
 from pathlib import Path
 
@@ -440,7 +442,8 @@ need_restart = any(s not in ("", "done", "canceled", "cancelled", "success") for
 )
 sys.exit(2 if need_restart and after else 0)
 PY
-  local rc=$?
+  rc=$?
+  set -e
   if ((rc == 2)); then
     log "Restarting seafile daemon to clear stuck clone task for $repo_id"
     restart_seafile_daemon
@@ -803,9 +806,10 @@ if ((${#_binding_rows[@]} == 1)); then
 elif ((${#_binding_rows[@]} > 1)); then
   echo "Found ${#_binding_rows[@]} leftover library bindings."
   _pick_labels=()
-  for _row in "${_binding_rows[@]}"; do
-    IFS='|' read -r _bid _bemail _bserver _bwt _btok <<<"$_row"
-    _pick_labels+=("${_bwt:-?}  (${_bid:0:8}… · ${_bemail:-no-email})")
+  for i in "${!_binding_rows[@]}"; do
+    IFS='|' read -r _bid _bemail _bserver _bwt _btok <<<"${_binding_rows[$i]}"
+    # Prefix with index so gum labels stay unique even when worktrees match.
+    _pick_labels+=("$((i + 1)). ${_bwt:-?}  (${_bid:0:8}… · ${_bemail:-no-email})")
   done
   _picked=$(printf '%s\n' "${_pick_labels[@]}" | gum choose --header "Which binding should Connect repair?")
   [[ -n ${_picked:-} ]] || fail "No binding selected."
@@ -817,7 +821,7 @@ elif ((${#_binding_rows[@]} > 1)); then
   done
   log "Selected leftover binding id=$existing_id email=$existing_email server=$existing_server worktree=$existing_worktree"
 fi
-unset _binding_rows _pick_labels _picked _row _bid _bemail _bserver _bwt _btok i
+unset _binding_rows _pick_labels _picked _bid _bemail _bserver _bwt _btok i
 
 server=""
 username=""

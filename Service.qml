@@ -137,8 +137,12 @@ Item {
     return true
   }
 
-  function pause() { runHelper(["pause"], 0) }
-  function resume() { runHelper(["resume"], 1) }
+  function pause() {
+    if (!runHelper(["pause"], 0)) noteBusy()
+  }
+  function resume() {
+    if (!runHelper(["resume"], 1)) noteBusy()
+  }
 
   function toggleRunning() {
     if (!installed || !helperReady) return
@@ -155,6 +159,7 @@ Item {
     actionStatus = tr("action.syncing", "Syncing…")
     if (!runHelper(["sync-now"], 1)) {
       _pendingSync = false
+      actionStatus = ""
       noteBusy()
     }
   }
@@ -162,9 +167,12 @@ Item {
   function snooze(seconds, label) {
     if (!installed || !helperReady) return
     if (busy) { noteBusy(); return }
+    if (!runHelper(["snooze", String(seconds), String(label)], 0)) {
+      noteBusy()
+      return
+    }
     actionStatus = tr("action.snoozed", "Snoozed")
     actionStatusTimer.restart()
-    runHelper(["snooze", String(seconds), String(label)], 0)
   }
 
   function installPackage() {
