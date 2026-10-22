@@ -27,6 +27,8 @@ Needs the `seafile` package (provides `seaf-cli`). The panel can install it with
 
 Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `https://` if you omit it, and asks before using cleartext HTTP.
 
+If the public hostname sits behind **Cloudflare** and login fails with error **1010**, use the direct/Tailscale Seafile URL instead (for example `http://100.x.x.x:8088`). Cloudflare often blocks API clients on the public name.
+
 ## Important
 
 - **One Seafile client.** Do not run `seafile-client` (GUI) alongside this. Both use the same data directory and will fight.

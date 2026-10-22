@@ -103,12 +103,20 @@ redact_cmd() {
 }
 
 # seaf-cli requires a scheme. Accept host[:port]/path] and add https://.
+# Never strip the slash pair in "https://" — `${url%/}` turns that into "https:/".
 normalize_server_url() {
   local raw=${1// /}
-  raw=${raw%/}
   if [[ -z $raw ]]; then
     echo ""
     return
+  fi
+  if [[ $raw =~ ^(https?://[^/]+)(/.*)$ ]]; then
+    local hostpart=${BASH_REMATCH[1]}
+    local pathpart=${BASH_REMATCH[2]}
+    while [[ $pathpart == */ ]]; do
+      pathpart=${pathpart%/}
+    done
+    raw="${hostpart}${pathpart}"
   fi
   if [[ $raw =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
     echo "$raw"
@@ -130,6 +138,10 @@ validate_server_url() {
   fi
   if [[ ! $url =~ ^https?:// ]]; then
     echo "Server URL must start with http:// or https:// (got: $url)."
+    return 1
+  fi
+  if [[ $url =~ ^https?:///*$ ]]; then
+    echo "Server URL is missing a host. Example: https://seafile.example.com"
     return 1
   fi
   if [[ $url =~ [[:space:]] ]]; then
@@ -176,6 +188,10 @@ explain_seaf_error() {
 
   if grep -q "unknown url type" <<<"$output"; then
     echo "Server URL is missing http:// or https://. Example: https://seafile.example.com"
+    return
+  fi
+  if grep -qiE 'error code:[[:space:]]*1010|cf-error-code.*1010|Cloudflare.*1010' <<<"$output"; then
+    echo "Cloudflare blocked this client (error 1010). Use your direct/Tailscale Seafile URL (for example http://100.x.x.x:8088), or allow /api2/ access in Cloudflare."
     return
   fi
   if is_auth_error "$output"; then
@@ -369,7 +385,16 @@ data = urllib.parse.urlencode({
     "platform_version": "",
 }).encode("utf-8")
 
-headers = {"Content-Type": "application/x-www-form-urlencoded"}
+# Cloudflare (and similar) often block Python-urllib's default User-Agent with
+# error 1010. Send a normal browser UA so /api2/auth-token/ can reach Seafile.
+headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
 if tfa:
     headers["X-SEAFILE-OTP"] = tfa
 
@@ -446,10 +471,7 @@ PY
 
   if ((rc != 0)) || [[ $out != OK$'\t'* ]]; then
     local detail=${out#ERROR$'\t'}
-    if [[ $detail == *"Unable to login with provided credentials"* ]]; then
-      fail "Login rejected: wrong username/password${tfa:+, or bad 2FA code}. Server said: Unable to login with provided credentials."
-    fi
-    fail "Login failed: ${detail:-unknown error}"
+    fail "Login failed: $(explain_seaf_error "$out" "$server")"
   fi
   AUTH_TOKEN=${out#OK$'\t'}
   [[ -n $AUTH_TOKEN ]] || fail "Login returned an empty token."
