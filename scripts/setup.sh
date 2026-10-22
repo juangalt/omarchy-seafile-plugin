@@ -230,6 +230,10 @@ explain_seaf_error() {
     echo "This library is encrypted. Re-run setup; encrypted libraries need a library password."
     return
   fi
+  if grep -qi 'Task is already in progress' <<<"$output"; then
+    echo "A sync/download for this library was already running (or stuck). It was cleared — run Connect/repair again."
+    return
+  fi
 
   local line
   line=$(grep -vE '^(Traceback|File "|  File |    )' <<<"$output" | grep -v '^[[:space:]]*$' | tail -1 || true)
@@ -238,6 +242,62 @@ explain_seaf_error() {
     return
   fi
   echo "Seafile command failed. See the log for the full output."
+}
+
+# Cancel leftover clone tasks for a library (failed earlier attempts leave
+# "Task is already in progress"). Restart the daemon if a canceled task sticks.
+clear_clone_tasks_for() {
+  local repo_id=$1
+  [[ -n $repo_id ]] || return 0
+  python3 - "$repo_id" "$DATA_DIR" <<'PY' >>"$LOG_FILE" 2>&1 || true
+import sys
+from pathlib import Path
+
+repo_id, datadir = sys.argv[1], Path(sys.argv[2])
+sock = datadir / "seafile.sock"
+if not sock.exists():
+    sys.exit(0)
+try:
+    from seafile.rpcclient import SeafileRpcClient
+    client = SeafileRpcClient(str(sock))
+except Exception as exc:
+    print("clear_clone_tasks: rpc unavailable:", exc)
+    sys.exit(0)
+
+def states():
+    out = []
+    for task in client.get_clone_tasks() or []:
+        rid = getattr(task, "repo_id", None) or ""
+        if rid == repo_id or not repo_id:
+            out.append(str(getattr(task, "state", "") or ""))
+    return out
+
+before = states()
+if before:
+    print("clear_clone_tasks: before", before)
+    try:
+        print("cancel", client.cancel_clone_task(repo_id))
+    except Exception as exc:
+        print("cancel failed:", exc)
+after = states()
+print("clear_clone_tasks: after", after)
+# Stick around as canceled/error/fetch → ask caller to restart.
+need_restart = any(s not in ("", "done", "canceled", "cancelled", "success") for s in after) or any(
+    s in ("canceled", "cancelled", "error") for s in after
+)
+sys.exit(2 if need_restart and after else 0)
+PY
+  local rc=$?
+  if ((rc == 2)); then
+    log "Restarting seafile daemon to clear stuck clone task for $repo_id"
+    if systemctl --user is-enabled seaf-daemon.service >/dev/null 2>&1; then
+      systemctl --user restart seaf-daemon.service >/dev/null 2>&1 || true
+    else
+      "${SEAF[@]}" stop >/dev/null 2>&1 || true
+      "${SEAF[@]}" start >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  fi
 }
 
 # sync/download call getpass() for an encrypted library. Capturing stderr
@@ -608,6 +668,7 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
 
     if [[ -n $existing_token ]]; then
       echo "Re-attaching with saved token → $existing_worktree"
+      clear_clone_tasks_for "$existing_id"
       if run_seaf_allow_libpass "Re-attach library (token)" "${SEAF[@]}" sync \
         -l "$existing_id" \
         -s "$server" \
@@ -622,6 +683,24 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
         log "Repair sync succeeded (token)"
         clear_secrets
         exit 0
+      fi
+      if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
+        clear_clone_tasks_for "$existing_id"
+        if run_seaf_allow_libpass "Re-attach library (token retry)" "${SEAF[@]}" sync \
+          -l "$existing_id" \
+          -s "$server" \
+          -u "$username" \
+          -T "$existing_token" \
+          -d "$existing_worktree"; then
+          echo
+          echo "Libraries:"
+          "${SEAF[@]}" list || true
+          echo
+          echo "Setup complete (re-attached existing binding)."
+          log "Repair sync succeeded (token retry)"
+          clear_secrets
+          exit 0
+        fi
       fi
       why=$(explain_seaf_error "$SEAF_OUT" "$server")
       echo "✗ Token re-attach failed: $why"
@@ -643,13 +722,24 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
     obtain_token_checked "$server" "$username" "$password" "$tfa"
     unset password tfa
     echo "Syncing ${existing_id} → ${existing_worktree}"
+    clear_clone_tasks_for "$existing_id"
     if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync \
       -l "$existing_id" \
       -s "$server" \
       -u "$username" \
       -T "$AUTH_TOKEN" \
       -d "$existing_worktree"; then
-      fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+      if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
+        clear_clone_tasks_for "$existing_id"
+        run_seaf_allow_libpass "Sync library (retry)" "${SEAF[@]}" sync \
+          -l "$existing_id" \
+          -s "$server" \
+          -u "$username" \
+          -T "$AUTH_TOKEN" \
+          -d "$existing_worktree" || fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+      else
+        fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+      fi
     fi
     echo
     echo "Libraries:"
@@ -716,18 +806,31 @@ mode=$(gum choose --header "How should this library land locally?" \
   "Sync into existing/empty folder (keeps local files)" \
   "Download into a parent directory (Seafile creates the library folder)")
 
+clear_clone_tasks_for "$lib_id"
 if [[ $mode == Sync* ]]; then
   mkdir -p "$folder"
   echo "Syncing ${lib_name} → ${folder}"
   if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder"; then
-    fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
+      clear_clone_tasks_for "$lib_id"
+      run_seaf_allow_libpass "Sync library (retry)" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder" \
+        || fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    else
+      fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    fi
   fi
 else
   parent=$(dirname "$folder")
   mkdir -p "$parent"
   echo "Downloading ${lib_name} under ${parent}"
   if ! run_seaf_allow_libpass "Download library" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent"; then
-    fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
+      clear_clone_tasks_for "$lib_id"
+      run_seaf_allow_libpass "Download library (retry)" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent" \
+        || fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    else
+      fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
+    fi
   fi
 fi
 
