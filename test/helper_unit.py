@@ -77,6 +77,24 @@ class HelperUnit(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 2.0, "timeout must not wait for the hung RPC")
 
+    def test_wait_until_up_requires_sock(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ini = Path(tmp) / "seafile.ini"
+            datadir = Path(tmp) / "seafile-data"
+            datadir.mkdir()
+            ini.write_text(str(datadir) + "\n", encoding="utf-8")
+            with mock.patch.object(helper, "CONF_DIR", Path(tmp)):
+                with mock.patch.object(helper, "owning_daemon_pids", return_value=[12345]):
+                    self.assertFalse(helper._wait_until_up(0.3))
+                sock = datadir / "seafile.sock"
+                sock.write_text("")
+                with mock.patch.object(helper, "owning_daemon_pids", return_value=[]):
+                    self.assertTrue(helper._wait_until_up(0.3))
+
 
 if __name__ == "__main__":
     unittest.main()

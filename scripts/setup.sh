@@ -264,7 +264,7 @@ restart_seafile_daemon() {
     "${SEAF[@]}" stop >/dev/null 2>&1 || true
     "${SEAF[@]}" start >/dev/null 2>&1 || true
   fi
-  wait_for_daemon_sock || log "Warning: seafile.sock not up after daemon restart"
+  wait_for_daemon_sock || fail "Seafile daemon did not create seafile.sock after restart."
 }
 
 # seaf-daemon sends client_id on every download permission-check. The server
@@ -330,30 +330,30 @@ sys.exit(0 if any(str(r.get("id") or "") == rid for r in (repos or []) if isinst
       log "Clone finished: library $repo_id is listed locally"
       return 0
     fi
-    # Inspect clone task state via RPC.
-    read -r state err < <(python3 - "$repo_id" "$DATA_DIR" <<'PY' || true
+    # Inspect clone task state via RPC (tab-separated: state may contain spaces).
+    IFS=$'\t' read -r state err < <(python3 - "$repo_id" "$DATA_DIR" <<'PY' || true
 import sys
 from pathlib import Path
 repo_id, datadir = sys.argv[1], Path(sys.argv[2])
 sock = datadir / "seafile.sock"
 if not sock.exists():
-    print("none 0")
+    print("none\t0")
     raise SystemExit(0)
 try:
     from seafile.rpcclient import SeafileRpcClient
     client = SeafileRpcClient(str(sock))
 except Exception:
-    print("none 0")
+    print("none\t0")
     raise SystemExit(0)
 for task in client.get_clone_tasks() or []:
     rid = getattr(task, "repo_id", None) or ""
     if rid != repo_id:
         continue
-    state = str(getattr(task, "state", "") or "")
+    state = str(getattr(task, "state", "") or "").replace("\t", " ")
     err = getattr(task, "error", 0) or 0
-    print(f"{state} {err}")
+    print(f"{state}\t{err}")
     raise SystemExit(0)
-print("none 0")
+print("none\t0")
 PY
 )
     state=${state:-none}

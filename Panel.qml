@@ -166,7 +166,8 @@ Panel {
         return
       }
       if (dy > 0 && actionIndex >= primaryActions.length - 1) {
-        if (moreOpen && moreActions.length > 0) {
+        if (moreActions.length > 0) {
+          moreOpen = true
           focusSection = "more"
           moreIndex = 0
         }

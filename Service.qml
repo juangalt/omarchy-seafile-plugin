@@ -22,6 +22,7 @@ Item {
   property string aggregate: "missing"
   // IPC status() reads this, so it stays the helper's English text.
   property string statusText: "Checking…"
+  Component.onCompleted: statusText = tr("checking", "Checking…")
   property int lastSyncTs: 0
   property var repos: []
   property var syncErrors: []

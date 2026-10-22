@@ -269,10 +269,11 @@ def stop_daemon() -> tuple[bool, str]:
 
 
 def _wait_until_up(timeout: float) -> bool:
+    """Wait until seafile.sock exists (RPC-ready). A bare PID is not enough."""
     deadline = time.monotonic() + timeout
     while True:
-        sock_on, pids = presence()
-        if sock_on or pids:
+        sock_on, _pids = presence()
+        if sock_on:
             return True
         if time.monotonic() >= deadline:
             return False
