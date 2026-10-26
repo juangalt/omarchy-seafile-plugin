@@ -44,5 +44,8 @@ if not seaf_cli:
     raise SystemExit(127)
 
 # Preserve seaf-cli's expected argv[0] for help text / logging.
+# Do not put tokens or passwords in this process's argv. /proc/PID/cmdline is
+# world-readable; mutating sys.argv later does not erase it. setup.sh passes
+# the account token in a mode-0600 -C file and the library password on stdin.
 sys.argv = ["seaf-cli", *sys.argv[1:]]
 runpy.run_path(seaf_cli, run_name="__main__")

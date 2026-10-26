@@ -66,15 +66,19 @@ def load_state() -> dict:
 
 
 def save_state(data: dict) -> None:
+    # Same directory as setup.log. 0700 so other users cannot list credential files.
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
     payload = json.dumps(data, indent=2) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix="state.", suffix=".tmp", dir=str(STATE_DIR))
     try:
+        os.chmod(tmp_name, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, STATE_PATH)
+        os.chmod(STATE_PATH, 0o600)
     except Exception:
         try:
             os.unlink(tmp_name)

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Interactive Seafile / seaf-cli setup for the Omarchy Seafile plugin.
 set -euo pipefail
+# `bash -x` would print tokens, passwords, and 2FA codes. Stay off.
+set +x
+# Private files (token config, log) must not be group/world readable.
+umask 077
 
 CONF_DIR="${HOME}/.ccnet"
 DATA_PARENT="${HOME}/.seafile-client"
@@ -12,6 +16,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Cloudflare often blocks Python-urllib's default User-Agent (error 1010).
 # Use a real argv (not a bash function) so setsid/exec can run it.
 SEAF=(python3 "$SCRIPT_DIR/seaf_cli_ua.py")
+# Mode-0600 account config passed to seaf-cli as -C. Never holds a library password.
+TOKEN_CONF=""
+# One-shot library password for the next seaf-cli call. Not exported.
+SEAF_LIBPASS=""
+SECRETS_TRAP=0
+# argv actually executed. Credential flags are removed; -C is appended when needed.
+SEAF_CMD=()
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -22,12 +33,29 @@ need() {
 ensure_log() {
   umask 077
   mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
   touch "$LOG_FILE"
   chmod 600 "$LOG_FILE"
   {
     echo
     echo "===== $(date -Iseconds) setup pid=$$ ====="
   } >>"$LOG_FILE"
+}
+
+# Seafile stores the library token in repo.db. Keep client metadata private.
+restrict_client_metadata() {
+  local path
+  for path in "$CONF_DIR" "$DATA_PARENT" "$DATA_DIR" "${CONF_DIR}/logs"; do
+    if [[ -d $path ]]; then
+      chmod 700 "$path" || true
+    fi
+  done
+  local file
+  for file in "$REPO_DB" "${DATA_DIR}/id" "${CONF_DIR}/seafile.ini"; do
+    if [[ -f $file ]]; then
+      chmod 600 "$file" || true
+    fi
+  done
 }
 
 log() {
@@ -38,11 +66,95 @@ log() {
 }
 
 clear_secrets() {
-  unset AUTH_TOKEN existing_token password tfa
+  unset AUTH_TOKEN existing_token password tfa SEAF_LIBPASS libpass
+  if [[ -n ${TOKEN_CONF:-} && -e ${TOKEN_CONF} ]]; then
+    rm -f -- "$TOKEN_CONF"
+  fi
+  TOKEN_CONF=""
+}
+
+cleanup_secrets() {
+  # Keep this quiet: an EXIT trap must not print secrets or change the exit code.
+  set +x
+  clear_secrets || true
+  restrict_client_metadata || true
+}
+
+install_secrets_trap() {
+  if ((SECRETS_TRAP)); then
+    return
+  fi
+  trap cleanup_secrets EXIT
+  trap 'cleanup_secrets; exit 130' INT
+  trap 'cleanup_secrets; exit 143' TERM
+  SECRETS_TRAP=1
+}
+
+# seaf-cli 9.0.x reads the account token from a user config (-C), not only -T.
+# Format is ConfigParser with [account] as the first section. '%' is escaped
+# because ConfigParser interpolation treats a single '%' as a format marker.
+# The file is created with mktemp (mode 0600) under the private log directory.
+write_token_conf() {
+  set +x
+  local token="$1"
+  if [[ -z $token || $token == *$'\n'* || $token == *$'\r'* ]]; then
+    fail "Login token is empty or contains a newline; refusing to store it."
+  fi
+  install_secrets_trap
+  umask 077
+  mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+  if [[ -z ${TOKEN_CONF} || ! -f ${TOKEN_CONF} ]]; then
+    TOKEN_CONF=$(mktemp "${LOG_DIR}/token.XXXXXX") || fail "Could not create a private token file."
+  fi
+  chmod 600 "$TOKEN_CONF"
+  local escaped="${token//%/%%}"
+  # builtin printf: the token must never be an argv element of an external command.
+  builtin printf '%s\n' '[account]' "token = ${escaped}" >"$TOKEN_CONF" \
+    || fail "Could not write the token file."
+  chmod 600 "$TOKEN_CONF"
+}
+
+# Drop credential flags and, for commands that authenticate, append -C.
+# seaf-cli accepts the token only as -T/--token or this config file.
+# Library passwords are not stored here; sync/download read them from getpass.
+prepare_seaf_cmd() {
+  set +x
+  SEAF_CMD=()
+  local -a cleaned=()
+  local arg needs=0 skip_next=0
+  for arg in "$@"; do
+    if ((skip_next)); then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+    list-remote | sync | download | download-by-name | create)
+      needs=1
+      cleaned+=("$arg")
+      ;;
+    -T | --token | -e | --libpasswd | -p | --password | -a | --tfa | -C)
+      # Skip the flag and its value so a caller cannot put a secret on argv.
+      skip_next=1
+      ;;
+    --token=* | --libpasswd=* | --password=* | --tfa=* | -T=* | -e=* | -p=* | -a=* | -C=*)
+      ;;
+    *)
+      cleaned+=("$arg")
+      ;;
+    esac
+  done
+  if ((needs)); then
+    if [[ -z ${TOKEN_CONF} || ! -f ${TOKEN_CONF} ]]; then
+      fail "Internal error: missing private token file."
+    fi
+    cleaned+=(-C "$TOKEN_CONF")
+  fi
+  SEAF_CMD=("${cleaned[@]}")
 }
 
 fail() {
-  local msg=$1
+  local msg="$1"
   clear_secrets
   echo
   echo "✗ $msg" >&2
@@ -187,7 +299,8 @@ is_encrypted_lib_error() {
 
 # Map noisy seaf-cli / urllib failures to one actionable sentence.
 explain_seaf_error() {
-  local output=$1
+  local output
+  output=$(redact_secrets "${1:-}")
   local server=${2:-}
 
   if grep -q "unknown url type" <<<"$output"; then
@@ -499,7 +612,7 @@ PY
 
 # sync/download call getpass() for an encrypted library. Capturing stderr
 # hides that prompt and the read blocks. Detach from the tty and close
-# stdin so it fails fast; the caller can then ask with gum and pass -e.
+# stdin so the first attempt fails fast instead of waiting on /dev/tty.
 seaf_cli_prompts_for_library() {
   local arg
   for arg in "$@"; do
@@ -510,35 +623,78 @@ seaf_cli_prompts_for_library() {
   return 1
 }
 
+# Replace known secrets in command output before it is appended to the log.
+redact_secrets() {
+  set +x
+  local text="$1"
+  shift
+  local secret
+  for secret in "$@" "${AUTH_TOKEN:-}" "${existing_token:-}"; do
+    [[ -n $secret ]] || continue
+    text=${text//"$secret"/'***'}
+  done
+  builtin printf '%s\n' "$text"
+}
+
 # Runs a command; on failure sets SEAF_RC / SEAF_OUT and returns non-zero
 # without exiting. Logs a redacted command line always.
+#
+# Account token: seaf-cli reads [account] token from the -C file (verified on
+# seaf-cli 9.0.21). It is not passed as -T.
+# Library password: seaf-cli has no file or environment option. It uses -e or
+# getpass(). With no controlling terminal, getpass reads one line from stdin.
+# setsid provides that, and `builtin printf` writes the line so it never
+# appears in an external command's argv.
 run_seaf_capture() {
+  set +x
   local label=$1
   shift
+  local libpass="${SEAF_LIBPASS-}"
+  SEAF_LIBPASS=""
+  prepare_seaf_cmd "$@"
   set +e
-  if seaf_cli_prompts_for_library "$@"; then
+  if [[ -n $libpass ]]; then
+    if [[ $libpass == *$'\n'* || $libpass == *$'\r'* ]]; then
+      unset libpass
+      set -e
+      fail "Library password must be a single line."
+    fi
+    if ! command -v setsid >/dev/null 2>&1; then
+      unset libpass
+      set -e
+      fail "setsid is required so the library password can be passed on stdin instead of the command line."
+    fi
+    SEAF_OUT=$(builtin printf '%s\n' "$libpass" | setsid --wait "${SEAF_CMD[@]}" 2>&1)
+  elif seaf_cli_prompts_for_library "$@"; then
     if command -v setsid >/dev/null 2>&1; then
-      SEAF_OUT=$(setsid --wait "$@" </dev/null 2>&1)
+      SEAF_OUT=$(setsid --wait "${SEAF_CMD[@]}" </dev/null 2>&1)
     else
-      SEAF_OUT=$("$@" </dev/null 2>&1)
+      SEAF_OUT=$("${SEAF_CMD[@]}" </dev/null 2>&1)
     fi
   else
-    SEAF_OUT=$("$@" 2>&1)
+    SEAF_OUT=$("${SEAF_CMD[@]}" 2>&1)
   fi
   SEAF_RC=$?
   set -e
+  local logged
+  logged=$(redact_secrets "$SEAF_OUT" "$libpass")
+  unset libpass
   {
-    echo "\$ $(redact_cmd "$@")   # $label"
-    # Keep command output; secrets should never appear there from seaf-cli.
-    printf '%s\n' "$SEAF_OUT"
+    echo "\$ $(redact_cmd "${SEAF_CMD[@]}")   # $label"
+    builtin printf '%s\n' "$logged"
     echo "(exit $SEAF_RC)"
   } >>"$LOG_FILE"
   return "$SEAF_RC"
 }
 
-# Like run_seaf_capture, but an encrypted library can be retried once with
-# a library password collected by gum (-e), not seaf-cli's getpass.
+prompt_library_password() {
+  gum input --password --placeholder "library password" --prompt "Library password> " || true
+}
+
+# Like run_seaf_capture, but an encrypted library can be retried once.
+# The password is collected by gum and written to seaf-cli's stdin, not -e.
 run_seaf_allow_libpass() {
+  set +x
   local label=$1
   shift
   if run_seaf_capture "$label" "$@"; then
@@ -548,14 +704,15 @@ run_seaf_allow_libpass() {
     local libpass=""
     echo "This library is encrypted. Encrypted libraries need a library password." >&2
     echo "Enter it now, or leave it empty to abort and re-run setup later." >&2
-    libpass=$(gum input --password --placeholder "library password" --prompt "Library password> ") || libpass=""
+    libpass=$(prompt_library_password)
     if [[ -n $libpass ]]; then
-      if run_seaf_capture "$label" "$@" -e "$libpass"; then
-        unset libpass
+      SEAF_LIBPASS=$libpass
+      unset libpass
+      if run_seaf_capture "$label" "$@"; then
         return 0
       fi
     fi
-    unset libpass
+    unset libpass SEAF_LIBPASS
   fi
   return 1
 }
@@ -573,9 +730,13 @@ run_seaf() {
 # and avoid putting the password on a logged seaf-cli argv.
 # Sets AUTH_TOKEN on success. Does not follow redirects.
 obtain_token_checked() {
-  local server=$1 username=$2 password=$3 tfa=${4:-}
+  set +x
+  local server="$1" username="$2" password="$3" tfa="${4:-}"
   local out rc log_server
   set +e
+  # Prefix assignments apply only to this python process. They are not exported,
+  # and the script is on stdin so the password is not an argv element.
+  # python pops them from os.environ after copying so it does not pass them on.
   out=$(
     SERVER="$server" USERNAME="$username" PASSWORD="$password" TFA="$tfa" DATADIR="$DATA_DIR" python3 - <<'PY'
 import json, os, ssl, sys, urllib.error, urllib.parse, urllib.request, secrets
@@ -616,11 +777,11 @@ TLS_MSG = (
     "Fix the certificate, or confirm a trusted LAN URL separately."
 )
 
-server = os.environ["SERVER"].rstrip("/")
-username = os.environ["USERNAME"]
-password = os.environ["PASSWORD"]
-tfa = os.environ.get("TFA") or ""
-datadir = os.environ.get("DATADIR") or ""
+server = os.environ.pop("SERVER").rstrip("/")
+username = os.environ.pop("USERNAME")
+password = os.environ.pop("PASSWORD")
+tfa = os.environ.pop("TFA", "") or ""
+datadir = os.environ.pop("DATADIR", "") or ""
 
 parts = urllib.parse.urlsplit(server)
 if parts.username is not None or parts.password is not None or "@" in parts.netloc:
@@ -639,7 +800,9 @@ if not device_id:
     device_id = secrets.token_hex(20)
     if datadir:
         os.makedirs(datadir, exist_ok=True)
-        with open(idfile, "w", encoding="utf-8") as fh:
+        os.chmod(datadir, 0o700)
+        fd = os.open(idfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(device_id)
 
 data = urllib.parse.urlencode({
@@ -725,23 +888,38 @@ PY
   else
     log_server=$server
   fi
+  local log_out
+  log_out="$out"
+  if [[ -n ${password:-} ]]; then
+    log_out=${log_out//"$password"/'***'}
+  fi
+  if [[ -n ${tfa:-} ]]; then
+    log_out=${log_out//"$tfa"/'***'}
+  fi
   {
     echo "\$ auth-token POST $log_server  # login check"
-    # never log token
+    # never log token, password, or 2FA code
     if [[ $out == OK$'\t'* ]]; then
       echo "OK (token acquired)"
     else
-      echo "$out"
+      builtin printf '%s\n' "$log_out"
     fi
     echo "(exit $rc)"
   } >>"$LOG_FILE"
+  unset log_out
 
   if ((rc != 0)) || [[ $out != OK$'\t'* ]]; then
-    local detail=${out#ERROR$'\t'}
-    fail "Login failed: $(explain_seaf_error "$out" "$server")"
+    local detail
+    detail="${out#ERROR$'\t'}"
+    detail=$(redact_secrets "$detail" "$password" "$tfa")
+    unset password tfa
+    fail "Login failed: $(explain_seaf_error "$detail" "$server")"
   fi
+  unset password tfa
   AUTH_TOKEN=${out#OK$'\t'}
+  unset out
   [[ -n $AUTH_TOKEN ]] || fail "Login returned an empty token."
+  write_token_conf "$AUTH_TOKEN"
 }
 
 # Prints one pipe-separated binding per line (id|email|server|worktree|token).
@@ -768,7 +946,7 @@ load_binding_row() {
 
 accept_server_url() {
   # Sets server from raw input. Confirms cleartext HTTP. Logs normalization.
-  local raw_server=$1
+  local raw_server="$1"
   server=$(normalize_server_url "$raw_server")
   if ! msg=$(validate_server_url "$server"); then
     log "Rejected server URL"
@@ -782,8 +960,9 @@ accept_server_url() {
 }
 
 prompt_login() {
+  set +x
   # Sets: server username AUTH_TOKEN (and uses password ephemerally)
-  local default_server=$1 default_user=$2
+  local default_server="$1" default_user="$2"
   local raw_server password tfa
 
   raw_server=$(gum input --value "$default_server" --placeholder "https://seafile.example.com" --prompt "Server URL> ")
@@ -807,10 +986,14 @@ prompt_login() {
   unset password tfa
 }
 
-need seaf-cli
-need gum
-ensure_log
-log "Starting Seafile setup"
+main() {
+  set +x
+  install_secrets_trap
+  need seaf-cli
+  need gum
+  ensure_log
+  restrict_client_metadata
+  log "Starting Seafile setup"
 
 echo "Seafile setup"
 echo "Log: $LOG_FILE"
@@ -892,12 +1075,12 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
 
     if [[ -n $existing_token ]]; then
       echo "Re-attaching with saved token → $existing_worktree"
+      write_token_conf "$existing_token"
       clear_clone_tasks_for "$existing_id"
       if run_seaf_allow_libpass "Re-attach library (token)" "${SEAF[@]}" sync \
         -l "$existing_id" \
         -s "$server" \
         -u "$username" \
-        -T "$existing_token" \
         -d "$existing_worktree"; then
         await_clone_success "$existing_id"
         echo
@@ -915,7 +1098,6 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
           -l "$existing_id" \
           -s "$server" \
           -u "$username" \
-          -T "$existing_token" \
           -d "$existing_worktree"; then
           await_clone_success "$existing_id"
           echo
@@ -953,7 +1135,6 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
       -l "$existing_id" \
       -s "$server" \
       -u "$username" \
-      -T "$AUTH_TOKEN" \
       -d "$existing_worktree"; then
       if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
         clear_clone_tasks_for "$existing_id"
@@ -961,7 +1142,6 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
           -l "$existing_id" \
           -s "$server" \
           -u "$username" \
-          -T "$AUTH_TOKEN" \
           -d "$existing_worktree" || fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
       else
         fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
@@ -988,7 +1168,7 @@ prompt_login "${existing_server:-https://}" "${existing_email:-}"
 
 echo
 echo "Fetching remote libraries from $server …"
-remote_json=$(run_seaf "List remote libraries" "${SEAF[@]}" list-remote -s "$server" -u "$username" -T "$AUTH_TOKEN" --json)
+remote_json=$(run_seaf "List remote libraries" "${SEAF[@]}" list-remote -s "$server" -u "$username" --json)
 
 mapfile -t choices < <(printf '%s\n' "$remote_json" | python3 -c '
 import json, sys
@@ -1036,10 +1216,10 @@ clear_clone_tasks_for "$lib_id"
 if [[ $mode == Sync* ]]; then
   mkdir -p "$folder"
   echo "Syncing ${lib_name} → ${folder}"
-  if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder"; then
+  if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -d "$folder"; then
     if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
       clear_clone_tasks_for "$lib_id"
-      run_seaf_allow_libpass "Sync library (retry)" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$folder" \
+      run_seaf_allow_libpass "Sync library (retry)" "${SEAF[@]}" sync -l "$lib_id" -s "$server" -u "$username" -d "$folder" \
         || fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
     else
       fail "Sync library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
@@ -1049,10 +1229,10 @@ else
   parent=$(dirname "$folder")
   mkdir -p "$parent"
   echo "Downloading ${lib_name} under ${parent}"
-  if ! run_seaf_allow_libpass "Download library" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent"; then
+  if ! run_seaf_allow_libpass "Download library" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -d "$parent"; then
     if grep -qi 'Task is already in progress' <<<"$SEAF_OUT"; then
       clear_clone_tasks_for "$lib_id"
-      run_seaf_allow_libpass "Download library (retry)" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -T "$AUTH_TOKEN" -d "$parent" \
+      run_seaf_allow_libpass "Download library (retry)" "${SEAF[@]}" download -l "$lib_id" -s "$server" -u "$username" -d "$parent" \
         || fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
     else
       fail "Download library: $(explain_seaf_error "$SEAF_OUT" "${server:-}")"
@@ -1069,3 +1249,8 @@ echo
 echo "Setup complete."
 log "Setup finished OK"
 clear_secrets
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -155,6 +157,20 @@ class HelperUnit(unittest.TestCase):
                     state.pop("pendingSyncTs", None)
                     helper.save_state(state)
                     self.assertNotIn("pendingSyncTs", helper.load_state())
+
+    def test_save_state_is_private_even_with_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_path = state_dir / "state.json"
+            with mock.patch.object(helper, "STATE_DIR", state_dir):
+                with mock.patch.object(helper, "STATE_PATH", state_path):
+                    old = os.umask(0o022)
+                    try:
+                        helper.save_state({"snoozeUntil": 1})
+                    finally:
+                        os.umask(old)
+                    self.assertEqual(stat.S_IMODE(state_dir.stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":
