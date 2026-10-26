@@ -54,7 +54,7 @@ Removal deletes the plugin checkout. It does not uninstall the `seafile` package
 | --- | --- |
 | Pause | Stops the Seafile daemon (and your user `seaf-daemon.service` if present) |
 | Snooze 15m / 1h | Pause, then auto-resume |
-| Connect / repair | Terminal wizard under **More** — re-attach a saved library, or sign in and sync |
+| Connect / repair | Terminal wizard under **More** — re-attach a leftover binding (password only when needed), or a full sign-in |
 
 Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `https://` if you omit it, and asks before using cleartext HTTP.
 
@@ -63,17 +63,17 @@ Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `http
 ## How Connect works
 
 1. Starts the daemon if needed and ensures a valid **40-character hex** `client_id` (Seafile rejects anything else on download permission-check), kept in sync with `~/.seafile-client/seafile-data/id`.
-2. Offers to re-attach a leftover binding when one exists: reuses the saved server URL and account email, tries the saved library token, and prompts only for the **account password** (and 2FA if you use it). Server URL is editable only if you opt in. A fresh Connect still asks for server, username, and password.
-3. Queues `seaf-cli sync` / `download`, clears stuck clone tasks if needed.
-4. **Waits until the library actually appears locally** before declaring success — `seaf-cli` alone only queues the clone.
+2. **Repair (leftover binding):** confirms the saved library, server, folder, and account; reuses that identity; tries the saved library token first; if the token is missing or rejected, prompts only for the **account password** (and 2FA if you use it). Changing the server URL is opt-in (default No). An invalid leftover URL forces an edit instead of failing silently.
+3. **Fresh Connect:** asks for server URL, username, and password, then lists remote libraries to sync or download.
+4. Queues `seaf-cli sync` / `download`, clears stuck clone tasks if needed, and **waits until the library appears locally** before declaring success — `seaf-cli` alone only queues the clone.
 
-If `seaf-cli` was initialized earlier but no library is linked yet, the bar may already look “configured.” Use **More → Connect / repair** to finish binding.
+If `seaf-cli` was initialized earlier but no library is linked yet, the bar may already look “configured.” Use **More → Connect / repair** to finish binding. The same path fixes **Needs re-attach** / **Library unbound** after a hard stop mid-sync (logout/reboot while uploading can leave empty local metadata while your files on disk stay intact).
 
 Setup log (directory mode `700`, file mode `600`):
 
 `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log`
 
-The account token is handed to `seaf-cli` in a mode-`600` config file (`-C`), not as `-T`. An encrypted library password is written to `seaf-cli`'s stdin, not as `-e`. Neither is written to the log. Account email and server URL may be.
+The account password is never stored. Login yields a short-lived account token handed to `seaf-cli` in a mode-`600` config file (`-C`), not as `-T`. An encrypted library password is written to `seaf-cli`'s stdin, not as `-e`. Neither is written to the log. Account email and server URL may be.
 
 ---
 
@@ -90,6 +90,7 @@ The Connect wizard runs `seaf-cli` through a small wrapper that sends a normal b
 - **One Seafile client.** Do not run `seafile-client` (GUI) alongside this. Both use the same data directory and will fight.
 - **Pause stops the whole daemon**, not a single library.
 - Prefer a full URL with scheme. LAN HTTP is allowed after an explicit confirm.
+- After logout or reboot during an active upload, open **Connect / repair** if the bar says the library is unbound — re-attach the same folder; do not download into a new empty path unless you intend a fresh copy.
 
 ---
 
