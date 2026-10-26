@@ -28,7 +28,7 @@
   "install": "Install Seafile",
   "installHelp": "Opens a terminal and installs the seafile package with yay",
   "setup": "Connect / repair…",
-  "setupHelp": "Opens a terminal wizard. Use a full URL (https://…). If a vault binding already exists, you can re-attach it.",
+  "setupHelp": "Opens a terminal wizard. Repair reuses the saved server and account and asks for the password only when needed. Fresh connect still needs the full URL (https://…).",
   "syncNow": "Sync now",
   "openFolder": "Open folder",
   "showLogs": "Show logs",
