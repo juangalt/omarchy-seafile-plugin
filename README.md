@@ -69,11 +69,11 @@ Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `http
 
 If `seaf-cli` was initialized earlier but no library is linked yet, the bar may already look “configured.” Use **More → Connect / repair** to finish binding.
 
-Setup log (mode `600`):
+Setup log (directory mode `700`, file mode `600`):
 
 `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log`
 
-Passwords are not written there; account email and server URL may be.
+The account token is handed to `seaf-cli` in a mode-`600` config file (`-C`), not as `-T`. An encrypted library password is written to `seaf-cli`'s stdin, not as `-e`. Neither is written to the log. Account email and server URL may be.
 
 ---
 
@@ -111,6 +111,7 @@ bash -n scripts/setup.sh
 python3 -m py_compile helper.py scripts/seaf_cli_ua.py
 node test/model.test.js
 python3 test/helper_unit.py
+bash test/argv_secrets.sh
 ```
 
 ---
