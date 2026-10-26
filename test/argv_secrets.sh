@@ -435,4 +435,25 @@ accept_repair_server "https://seafile.example.test"
 [[ $server == "https://other.example.test" ]] || exit 2
 ' _ "$ROOT/scripts/setup.sh" || die "accept_repair_server should apply an edited URL when confirmed"
 
+# Invalid leftover URL must force an edit prompt (no silent hard-fail).
+# https:// alone normalizes/validates as missing host.
+bash -c '
+source "$1"
+gum() {
+  case "$1" in
+    confirm)
+      echo "confirm should not run when saved URL is invalid" >&2
+      return 99
+      ;;
+    input)
+      printf "%s\n" "https://fixed.example.test"
+      ;;
+    *) echo "unexpected gum: $*" >&2; return 99 ;;
+  esac
+}
+server=""
+accept_repair_server "https://"
+[[ $server == "https://fixed.example.test" ]] || exit 2
+' _ "$ROOT/scripts/setup.sh" || die "accept_repair_server should force edit for an invalid saved URL"
+
 say "argv secret checks passed"

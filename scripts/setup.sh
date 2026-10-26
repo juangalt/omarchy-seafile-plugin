@@ -709,10 +709,18 @@ prompt_account_auth() {
 }
 
 # Repair: keep the leftover server URL unless the user opts to edit it.
+# If the saved URL no longer validates, force an edit instead of hard-failing.
 accept_repair_server() {
   local saved=$1
-  if gum confirm --default=No "Change server URL from ${saved}?"; then
-    local raw_server
+  local raw_server msg need_edit=0
+  if ! msg=$(validate_server_url "$(normalize_server_url "$saved")"); then
+    echo "Saved server URL is no longer valid: $msg"
+    log "Saved server URL failed validation: $saved ($msg)"
+    need_edit=1
+  elif gum confirm --default=No "Change server URL from ${saved}?"; then
+    need_edit=1
+  fi
+  if ((need_edit)); then
     raw_server=$(gum input --value "$saved" \
       --placeholder "https://seafile.example.com" \
       --prompt "Server URL> ")
