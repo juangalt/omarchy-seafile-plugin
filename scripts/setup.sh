@@ -691,6 +691,38 @@ prompt_library_password() {
   gum input --password --placeholder "library password" --prompt "Library password> " || true
 }
 
+# Account password (+ optional 2FA) only. Sets AUTH_TOKEN via obtain_token_checked.
+# Caller must already have set server + username. Password stays ephemeral.
+prompt_account_auth() {
+  set +x
+  local password tfa
+  password=$(gum input --password --placeholder "password" --prompt "Password> ")
+  [[ -n $password ]] || fail "Password required."
+  tfa=""
+  if gum confirm --default=No "This account uses two-factor authentication (2FA)?"; then
+    tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
+    [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
+  fi
+  echo "Signing in to $server as $username …"
+  obtain_token_checked "$server" "$username" "$password" "$tfa"
+  unset password tfa
+}
+
+# Repair: keep the leftover server URL unless the user opts to edit it.
+accept_repair_server() {
+  local saved=$1
+  if gum confirm --default=No "Change server URL from ${saved}?"; then
+    local raw_server
+    raw_server=$(gum input --value "$saved" \
+      --placeholder "https://seafile.example.com" \
+      --prompt "Server URL> ")
+    [[ -n $raw_server ]] || fail "Server URL required."
+    accept_server_url "$raw_server"
+  else
+    accept_server_url "$saved"
+  fi
+}
+
 # Like run_seaf_capture, but an encrypted library can be retried once.
 # The password is collected by gum and written to seaf-cli's stdin, not -e.
 run_seaf_allow_libpass() {
@@ -961,9 +993,9 @@ accept_server_url() {
 
 prompt_login() {
   set +x
-  # Sets: server username AUTH_TOKEN (and uses password ephemerally)
+  # Full sign-in: server, username, then password (+ optional 2FA).
   local default_server="$1" default_user="$2"
-  local raw_server password tfa
+  local raw_server
 
   raw_server=$(gum input --value "$default_server" --placeholder "https://seafile.example.com" --prompt "Server URL> ")
   [[ -n $raw_server ]] || fail "Server URL required."
@@ -972,18 +1004,7 @@ prompt_login() {
   username=$(gum input --value "$default_user" --placeholder "you@example.com" --prompt "Username> ")
   [[ -n $username ]] || fail "Username required."
 
-  password=$(gum input --password --placeholder "password" --prompt "Password> ")
-  [[ -n $password ]] || fail "Password required."
-
-  tfa=""
-  if gum confirm --default=No "This account uses two-factor authentication (2FA)?"; then
-    tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
-    [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
-  fi
-
-  echo "Signing in to $server …"
-  obtain_token_checked "$server" "$username" "$password" "$tfa"
-  unset password tfa
+  prompt_account_auth
 }
 
 main() {
@@ -1065,11 +1086,9 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
   echo "  Account : $existing_email"
   echo
   if gum confirm "Try to re-attach that library?"; then
-    repair_mode=1
-    raw_server=$(gum input --value "$existing_server" \
-      --placeholder "https://seafile.example.com" \
-      --prompt "Server URL (edit if the saved one is wrong)> ")
-    accept_server_url "$raw_server"
+    # Identity comes from the leftover binding. Only the account password
+    # (and optional 2FA) is prompted when the saved token is missing or dead.
+    accept_repair_server "$existing_server"
     mkdir -p "$existing_worktree"
     username=$existing_email
 
@@ -1114,21 +1133,12 @@ if [[ -n $existing_id && -n $existing_server && -n $existing_worktree && -n $exi
       echo "✗ Token re-attach failed: $why"
       log "Token re-attach failed: $why"
       unset existing_token
-      echo "Continuing with a password login for the same library…"
+      echo "Continuing with a password login for the same account…"
     else
-      echo "No saved token — need a password login for this library."
+      echo "No saved token — password required for $existing_email."
     fi
 
-    password=$(gum input --password --placeholder "password" --prompt "Password> ")
-    [[ -n $password ]] || fail "Password required."
-    tfa=""
-    if gum confirm --default=No "This account uses two-factor authentication (2FA)?"; then
-      tfa=$(gum input --placeholder "123456" --prompt "2FA code> ")
-      [[ -n $tfa ]] || fail "2FA code required when 2FA is enabled."
-    fi
-    echo "Signing in to $server …"
-    obtain_token_checked "$server" "$username" "$password" "$tfa"
-    unset password tfa
+    prompt_account_auth
     echo "Syncing ${existing_id} → ${existing_worktree}"
     clear_clone_tasks_for "$existing_id"
     if ! run_seaf_allow_libpass "Sync library" "${SEAF[@]}" sync \

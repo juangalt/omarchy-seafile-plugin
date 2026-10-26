@@ -403,4 +403,36 @@ stat -c %a "$TOKEN_CONF" >"$2/token-mode"
 assert_file_lacks_secrets "$TRACE2" "token writer xtrace"
 [[ $(cat "$TMP/token-x/token-mode") == 600 ]] || die "token writer file mode is not 600"
 
+# Repair keeps the leftover server URL unless the user opts to edit it.
+# Default gum confirm answer is No (--default=No).
+bash -c '
+source "$1"
+gum() {
+  case "$1" in
+    confirm) return 1 ;;
+    *) echo "unexpected gum: $*" >&2; return 99 ;;
+  esac
+}
+server=""
+accept_repair_server "https://seafile.example.test"
+[[ $server == "https://seafile.example.test" ]] || exit 2
+' _ "$ROOT/scripts/setup.sh" || die "accept_repair_server should keep the saved HTTPS URL by default"
+
+bash -c '
+source "$1"
+gum() {
+  case "$1" in
+    confirm) return 0 ;;
+    input)
+      # Return an edited URL when repair opts into Change server URL.
+      printf "%s\n" "https://other.example.test"
+      ;;
+    *) echo "unexpected gum: $*" >&2; return 99 ;;
+  esac
+}
+server=""
+accept_repair_server "https://seafile.example.test"
+[[ $server == "https://other.example.test" ]] || exit 2
+' _ "$ROOT/scripts/setup.sh" || die "accept_repair_server should apply an edited URL when confirmed"
+
 say "argv secret checks passed"
