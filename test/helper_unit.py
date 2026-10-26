@@ -172,6 +172,55 @@ class HelperUnit(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(state_dir.stat().st_mode), 0o700)
                     self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
 
+    def test_repo_appears_stuck_initializing_idle(self):
+        now = 1_000_000.0
+        activity = {"vault": int(now - 200)}
+        self.assertTrue(
+            helper.repo_appears_stuck(
+                {"name": "vault", "state": "initializing"},
+                activity,
+                now=now,
+                idle_sec=90,
+            )
+        )
+        activity_fresh = {"vault": int(now - 10)}
+        self.assertFalse(
+            helper.repo_appears_stuck(
+                {"name": "vault", "state": "initializing"},
+                activity_fresh,
+                now=now,
+                idle_sec=90,
+            )
+        )
+        self.assertFalse(
+            helper.repo_appears_stuck(
+                {"name": "vault", "state": "synchronized"},
+                activity,
+                now=now,
+            )
+        )
+        self.assertTrue(
+            helper.repo_appears_stuck({"name": "vault", "state": "error"}, {}, now=now)
+        )
+
+    def test_status_needs_recovery(self):
+        self.assertTrue(helper.status_needs_recovery({"aggregate": "unreachable", "repos": []}))
+        self.assertFalse(
+            helper.status_needs_recovery(
+                {"aggregate": "synchronized", "repos": [{"name": "vault", "state": "synchronized"}]}
+            )
+        )
+        with mock.patch.object(helper, "last_activity_from_log", return_value={"vault": 1}):
+            self.assertTrue(
+                helper.status_needs_recovery(
+                    {
+                        "aggregate": "syncing",
+                        "repos": [{"name": "vault", "state": "initializing", "lastSyncTs": 1}],
+                    },
+                    now=10_000.0,
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

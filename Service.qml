@@ -105,6 +105,7 @@ Item {
     refreshing = true
     statusProcess.command = ["python3", helperPath, "status"]
     statusProcess.running = true
+    helperWatchdog.interval = 20000
     helperWatchdog.restart()
   }
 
@@ -190,6 +191,8 @@ Item {
     _controlError = ""
     controlProcess.command = ["python3", helperPath].concat(args)
     controlProcess.running = true
+    // Stop/restart + RPC can exceed the short status probe budget.
+    helperWatchdog.interval = 45000
     helperWatchdog.restart()
     return true
   }
@@ -230,7 +233,8 @@ Item {
       actionStatus = ""
       noteBusy()
     } else {
-      // Pre-RPC soft status: watchdog/fallback cover a hung helper.
+      // Pre-exit budget covers restart-on-stuck before onExited.
+      syncSettleFallback.interval = 45000
       syncSettleFallback.restart()
     }
   }
@@ -534,8 +538,11 @@ Item {
             root._syncAcceptedAt = Date.now()
             root._syncStatusPolls = 0
             root.actionStatusTimer.stop()
-            root.actionStatus = root.tr("action.syncRequested", "Sync requested…")
+            root.actionStatus = (syncPayload && syncPayload.recovered)
+              ? root.tr("action.recoveredSync", "Restarted daemon…")
+              : root.tr("action.syncRequested", "Sync requested…")
             root.syncReadyCheck.restart()
+            root.syncSettleFallback.interval = 8000
             root.syncSettleFallback.restart()
           }
         } else {

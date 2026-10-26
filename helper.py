@@ -26,9 +26,13 @@ SEAF_UNIT = "seaf-daemon.service"
 SYNC_LINE = re.compile(
     r"Repo '([^']+)' sync state transition from '?[^']*'? to '?synchronized'?"
 )
+ACTIVITY_LINE = re.compile(r"Repo '([^']+)' sync state transition from")
 TS_LINE = re.compile(r"^\[(\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\]")
 _NAME_KEYS = ("sync-worktree-name", "origin-repo-name", "repo-name", "name")
 _REVIVE_STATES = {"active", "activating", "reloading", "deactivating"}
+# initializing with no sync-mgr progress for this long → treat as wedged.
+STUCK_IDLE_SEC = 90
+_STUCK_AGGREGATES = frozenset({"unreachable", "unknown", "error"})
 
 
 def emit(payload: dict) -> None:
@@ -305,6 +309,24 @@ def start_daemon() -> tuple[bool, str]:
     return False, (err or "").strip() or unit_err or "failed to start seafile daemon"
 
 
+def restart_daemon() -> tuple[bool, str]:
+    """Restart seaf-daemon (preferred fix for a wedged sync manager)."""
+    snap = unit_snapshot()
+    unit_err = ""
+    if snap.get("LoadState") == "loaded":
+        code, _out, err = run(["systemctl", "--user", "restart", SEAF_UNIT], timeout=30)
+        unit_err = (err or "").strip()
+        if code == 0 and _wait_until_up(10.0):
+            return True, ""
+    stopped, stop_err = stop_daemon()
+    if not stopped:
+        return False, stop_err or unit_err or "failed to stop seafile daemon"
+    ok, start_err = start_daemon()
+    if ok:
+        return True, ""
+    return False, start_err or unit_err or "failed to restart seafile daemon"
+
+
 def rpc_client():
     datadir = seafile_datadir()
     if datadir is None:
@@ -460,6 +482,65 @@ def last_sync_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
         if sync_match and current_ts > 0:
             found[sync_match.group(1)] = current_ts
     return found
+
+
+def last_activity_from_log(limit_bytes: int = 200_000) -> dict[str, int]:
+    """Map repo name -> unix timestamp of last sync-mgr state transition."""
+    data = _read_seafile_log_tail(limit_bytes)
+    if not data:
+        return {}
+
+    found: dict[str, int] = {}
+    current_ts = 0
+    for line in data.splitlines():
+        ts_match = TS_LINE.match(line)
+        if ts_match:
+            try:
+                current_ts = int(time.mktime(time.strptime(ts_match.group(1), "%m/%d/%y %H:%M:%S")))
+            except ValueError:
+                current_ts = 0
+        activity_match = ACTIVITY_LINE.search(line)
+        if activity_match and current_ts > 0:
+            found[activity_match.group(1)] = current_ts
+    return found
+
+
+def repo_appears_stuck(
+    repo: dict,
+    activity_by_name: dict[str, int] | None = None,
+    *,
+    now: float | None = None,
+    idle_sec: int = STUCK_IDLE_SEC,
+) -> bool:
+    """True when a library looks wedged (error, or initializing with no progress)."""
+    state = str(repo.get("state") or "").strip().lower()
+    if state == "error":
+        return True
+    if state != "initializing":
+        return False
+    clock = time.time() if now is None else now
+    name = str(repo.get("name") or "")
+    activity = 0
+    if activity_by_name is not None:
+        activity = int(activity_by_name.get(name) or 0) if name else 0
+    elif name:
+        activity = int(last_activity_from_log().get(name) or 0)
+    if activity <= 0:
+        activity = _as_int(repo.get("lastSyncTs"))
+    if activity <= 0:
+        return True
+    return (clock - activity) >= idle_sec
+
+
+def status_needs_recovery(status: dict, *, now: float | None = None) -> bool:
+    """True when Sync now should restart the daemon before (or after) RPC."""
+    if str(status.get("aggregate") or "") in _STUCK_AGGREGATES:
+        return True
+    repos = status.get("repos") or []
+    if not repos:
+        return False
+    activity = last_activity_from_log()
+    return any(repo_appears_stuck(repo, activity, now=now) for repo in repos if isinstance(repo, dict))
 
 
 def enrich_unknown_error(repo_id: str, repo_name: str, error: str) -> str:
@@ -896,6 +977,31 @@ def _rpc_sync(client, repo_id: str, timeout: float = 20.0) -> None:
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _sync_repos(client, repos: list) -> tuple[int, list[str]]:
+    synced = 0
+    errors: list[str] = []
+    for repo in repos:
+        if not isinstance(repo, dict):
+            continue
+        rid = str(repo.get("id") or "")
+        if not rid:
+            continue
+        try:
+            _rpc_sync(client, rid)
+            synced += 1
+        except Exception as exc:  # noqa: BLE001 — surface to UI
+            errors.append("%s: %s" % (repo.get("name") or rid, exc))
+    return synced, errors
+
+
+def _errors_look_transient(errors: list[str]) -> bool:
+    blob = " ".join(errors).lower()
+    return any(
+        needle in blob
+        for needle in ("timed out", "timeout", "unavailable", "connection", "rpc")
+    )
+
+
 def cmd_sync_now() -> int:
     if not which_seaf():
         emit({"ok": False, "error": "seaf-cli not installed"})
@@ -906,35 +1012,77 @@ def cmd_sync_now() -> int:
         clear_snooze_state()
 
     status = build_status()
+    recovered = False
 
     if not status.get("running"):
         ok, err = start_daemon()
         if not ok:
-            emit({"ok": False, "error": err or "failed to start seafile daemon"})
+            emit({"ok": False, "error": err or "failed to start seafile daemon", "recovered": False})
             return 1
         time.sleep(0.8)
+        status = build_status()
+    elif status_needs_recovery(status):
+        ok, err = restart_daemon()
+        if not ok:
+            emit({
+                "ok": False,
+                "error": err or "failed to restart stuck seafile daemon",
+                "recovered": False,
+            })
+            return 1
+        recovered = True
+        time.sleep(0.8)
+        status = build_status()
 
     client = rpc_client()
     if client is None:
-        emit({"ok": False, "error": "seafile RPC unavailable; is the daemon running?"})
+        emit({
+            "ok": False,
+            "error": "seafile RPC unavailable; is the daemon running?",
+            "recovered": recovered,
+        })
         return 1
 
     repos = status.get("repos") or []
     if not repos:
-        # Refresh after start. Skip another stop attempt; snooze was cleared.
-        repos = build_status().get("repos") or []
+        # Refresh after start/restart. Skip another stop attempt; snooze was cleared.
+        status = build_status()
+        repos = status.get("repos") or []
 
-    synced = 0
-    errors = []
-    for repo in repos:
-        rid = str(repo.get("id") or "")
-        if not rid:
-            continue
-        try:
-            _rpc_sync(client, rid)
-            synced += 1
-        except Exception as exc:  # noqa: BLE001 — surface to UI
-            errors.append("%s: %s" % (repo.get("name") or rid, exc))
+    synced, errors = _sync_repos(client, repos)
+
+    # One recovery retry: hung RPC, or libraries still wedged after the request.
+    retry = False
+    if errors and _errors_look_transient(errors):
+        retry = True
+    elif synced > 0 and status_needs_recovery(build_status()):
+        retry = True
+
+    if retry and not recovered:
+        ok, err = restart_daemon()
+        if ok:
+            recovered = True
+            time.sleep(0.8)
+            client = rpc_client()
+            if client is None:
+                emit({
+                    "ok": False,
+                    "error": "seafile RPC unavailable after restart",
+                    "recovered": True,
+                    "recovery": "Restarted stuck daemon",
+                })
+                return 1
+            status = build_status()
+            repos = status.get("repos") or []
+            synced, errors = _sync_repos(client, repos)
+        elif not synced:
+            emit({
+                "ok": False,
+                "error": err or "failed to restart stuck seafile daemon",
+                "errors": errors,
+                "recovered": False,
+            })
+            return 1
 
     error_text = "; ".join(errors)
     if synced > 0 and not errors:
@@ -949,6 +1097,8 @@ def cmd_sync_now() -> int:
         "requested": synced > 0,
         "errors": errors,
         "error": error_text,
+        "recovered": recovered,
+        "recovery": "Restarted stuck daemon" if recovered else "",
     })
     return 0 if not errors else 1
 

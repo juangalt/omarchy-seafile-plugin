@@ -46,7 +46,7 @@ Removal deletes the plugin checkout. It does not uninstall the `seafile` package
 | Input | Action |
 | --- | --- |
 | Left-click | Open the panel |
-| Middle-click | Sync now |
+| Middle-click | Sync now (also restarts a stuck daemon) |
 | Right-click | Refresh status |
 | `s` / `p` | Sync now / pause·resume (panel focused) |
 
