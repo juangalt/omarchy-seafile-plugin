@@ -169,7 +169,9 @@ Panel {
     if (!seafile.installed || !seafile.configured || seafile.repos.length === 0) return
     var id = String(repoId || "")
     if (id === "") {
-      if (focusSection === "libraries" && libraryIndex >= 0 && libraryIndex < seafile.repos.length)
+      // Prefer the last focused library even when opened from More (focusSection
+      // is "more" then, so do not require focusSection === "libraries").
+      if (libraryIndex >= 0 && libraryIndex < seafile.repos.length)
         id = String((seafile.repos[libraryIndex] && seafile.repos[libraryIndex].id) || "")
       if (id === "") id = String((seafile.repos[0] && seafile.repos[0].id) || "")
     }
