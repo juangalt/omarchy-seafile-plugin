@@ -25,6 +25,7 @@ function defaultStatus() {
     snoozeUntil: 0,
     snoozeLabel: "",
     runningDespiteSnooze: false,
+    globalAutoSync: true,
     aggregate: "missing",
     statusText: "Unavailable",
     lastSyncTs: 0,
@@ -187,11 +188,53 @@ function libraryStateLabel(state, tr) {
   return translator(tr)(mapped[0], mapped[1])
 }
 
+var SYNC_INTERVAL_PRESETS = [
+  { id: "onChange", seconds: 0, key: "sync.interval.onChange", fallback: "On change" },
+  { id: "1m", seconds: 60, key: "sync.interval.1m", fallback: "Every 1 minute" },
+  { id: "5m", seconds: 300, key: "sync.interval.5m", fallback: "Every 5 minutes" },
+  { id: "15m", seconds: 900, key: "sync.interval.15m", fallback: "Every 15 minutes" },
+  { id: "1h", seconds: 3600, key: "sync.interval.1h", fallback: "Every hour" }
+]
+
+function syncIntervalPresets() {
+  return SYNC_INTERVAL_PRESETS.slice()
+}
+
+function syncModeLabel(repo, tr) {
+  if (!repo) return ""
+  var t = translator(tr)
+  if (repo.autoSync === false) return t("sync.autoOff", "Auto sync off")
+  var sec = Number(repo.syncIntervalSec || 0)
+  if (!isFinite(sec) || sec <= 0) return t("sync.onChange", "On change")
+  for (var i = 0; i < SYNC_INTERVAL_PRESETS.length; i++) {
+    if (SYNC_INTERVAL_PRESETS[i].seconds === sec)
+      return t(SYNC_INTERVAL_PRESETS[i].key, SYNC_INTERVAL_PRESETS[i].fallback)
+  }
+  if (sec < 60) return t("sync.everySeconds", "Every %1s").replace("%1", String(sec))
+  if (sec % 3600 === 0)
+    return t("sync.everyHours", "Every %1h").replace("%1", String(Math.floor(sec / 3600)))
+  if (sec % 60 === 0)
+    return t("sync.everyMinutes", "Every %1m").replace("%1", String(Math.floor(sec / 60)))
+  return t("sync.everySeconds", "Every %1s").replace("%1", String(sec))
+}
+
+function presetIndexForInterval(seconds) {
+  var sec = Number(seconds || 0)
+  if (!isFinite(sec) || sec < 0) sec = 0
+  for (var i = 0; i < SYNC_INTERVAL_PRESETS.length; i++) {
+    if (SYNC_INTERVAL_PRESETS[i].seconds === sec) return i
+  }
+  return -1
+}
+
 function libraryMeta(repo, tr) {
   if (!repo) return ""
   var parts = []
   var state = libraryStateLabel(repo.state, tr)
   if (state !== "") parts.push(state)
+  // Skip duplicate when state is already "auto sync disabled".
+  var mode = syncModeLabel(repo, tr)
+  if (mode !== "" && String(repo.state || "") !== "auto sync disabled") parts.push(mode)
   var path = String(repo.path || "")
   if (path !== "") parts.push(path)
   return parts.join(" · ")
@@ -244,6 +287,9 @@ if (typeof module !== "undefined") {
     libraryMeta: libraryMeta,
     libraryError: libraryError,
     controlMessage: controlMessage,
-    primaryPath: primaryPath
+    primaryPath: primaryPath,
+    syncModeLabel: syncModeLabel,
+    syncIntervalPresets: syncIntervalPresets,
+    presetIndexForInterval: presetIndexForInterval
   }
 }

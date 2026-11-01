@@ -19,6 +19,7 @@ Item {
   property int snoozeUntil: 0
   property string snoozeLabel: ""
   property bool runningDespiteSnooze: false
+  property bool globalAutoSync: true
   property string aggregate: "missing"
   // IPC status() reads this, so it stays the helper's English text.
   property string statusText: "Checking…"
@@ -114,6 +115,12 @@ Item {
     actionStatusTimer.restart()
   }
 
+  function flashStatus(message) {
+    actionStatus = String(message || "")
+    if (actionStatus !== "") actionStatusTimer.restart()
+    else actionStatusTimer.stop()
+  }
+
   function cancelSyncSettle() {
     _awaitingSyncSettle = false
     _sawSyncingAfterRequest = false
@@ -149,6 +156,7 @@ Item {
     snoozeUntil = Number(parsed.snoozeUntil || 0)
     snoozeLabel = String(parsed.snoozeLabel || "")
     runningDespiteSnooze = parsed.runningDespiteSnooze === true
+    globalAutoSync = parsed.globalAutoSync !== false
     aggregate = String(parsed.aggregate || "")
     statusText = String(parsed.statusText || "")
     lastSyncTs = Number(parsed.lastSyncTs || 0)
@@ -249,6 +257,52 @@ Item {
     }
     actionStatus = tr("action.snoozed", "Snoozed")
     actionStatusTimer.restart()
+  }
+
+  function patchRepoSettings(repoId, autoSync, syncIntervalSec) {
+    var rid = String(repoId || "")
+    if (rid === "") return
+    var next = []
+    for (var i = 0; i < repos.length; i++) {
+      var repo = repos[i] || {}
+      if (String(repo.id || "") !== rid) {
+        next.push(repo)
+        continue
+      }
+      var copy = {}
+      for (var key in repo) copy[key] = repo[key]
+      if (autoSync !== undefined) copy.autoSync = autoSync === true
+      if (syncIntervalSec !== undefined) {
+        var sec = Number(syncIntervalSec)
+        copy.syncIntervalSec = isFinite(sec) && sec > 0 ? Math.floor(sec) : 0
+      }
+      next.push(copy)
+    }
+    repos = next
+  }
+
+  function setAutoSync(repoId, enabled) {
+    if (!installed || !helperReady) return
+    if (busy) { noteBusy(); return }
+    cancelSyncSettle()
+    actionStatus = tr("action.updatingSync", "Updating sync settings…")
+    actionStatusTimer.restart()
+    if (!runHelper(["set-auto-sync", String(repoId || ""), enabled ? "on" : "off"])) {
+      actionStatus = ""
+      noteBusy()
+    }
+  }
+
+  function setSyncInterval(repoId, seconds) {
+    if (!installed || !helperReady) return
+    if (busy) { noteBusy(); return }
+    cancelSyncSettle()
+    actionStatus = tr("action.updatingSync", "Updating sync settings…")
+    actionStatusTimer.restart()
+    if (!runHelper(["set-sync-interval", String(repoId || ""), String(seconds)])) {
+      actionStatus = ""
+      noteBusy()
+    }
   }
 
   function installPackage() {
@@ -547,7 +601,18 @@ Item {
           }
         } else {
           root.cancelSyncSettle()
-          root.actionStatus = ""
+          if (syncPayload && syncPayload.id && (syncPayload.autoSync !== undefined
+              || syncPayload.syncIntervalSec !== undefined)) {
+            root.patchRepoSettings(
+              syncPayload.id,
+              syncPayload.autoSync,
+              syncPayload.syncIntervalSec
+            )
+            root.actionStatus = root.tr("action.syncUpdated", "Sync settings updated")
+            root.actionStatusTimer.restart()
+          } else {
+            root.actionStatus = ""
+          }
         }
       }
       settleTimer.ticks = 0

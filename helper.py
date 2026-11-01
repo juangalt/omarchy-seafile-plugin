@@ -33,6 +33,10 @@ _REVIVE_STATES = {"active", "activating", "reloading", "deactivating"}
 # initializing with no sync-mgr progress for this long → treat as wedged.
 STUCK_IDLE_SEC = 90
 _STUCK_AGGREGATES = frozenset({"unreachable", "unknown", "error"})
+# Seafile stores these as RepoProperty; GUI uses true/false (not 0/1) for auto-sync.
+_PROP_AUTO_SYNC = "auto-sync"
+_PROP_SYNC_INTERVAL = "sync-interval"
+_DAEMON_REQUIRED = "Seafile daemon is not running — resume syncing first"
 
 
 def emit(payload: dict) -> None:
@@ -379,11 +383,50 @@ def _as_int(value: object) -> int:
         return 0
 
 
+def parse_auto_sync_prop(value: object, default: bool = True) -> bool:
+    """Parse Seafile auto-sync property. Prefer true/false; 0/1 are ambiguous."""
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text == "":
+        return default
+    if text in ("false", "no", "off"):
+        return False
+    if text in ("true", "yes", "on"):
+        return True
+    # Bare 0 means off; bare 1 is unreliable on some builds — leave default.
+    if text == "0":
+        return False
+    return default
+
+
+def parse_sync_interval_prop(value: object) -> int:
+    """Seconds between polls. 0 / empty means event-driven (on change)."""
+    if value is None:
+        return 0
+    text = str(value).strip()
+    if text == "":
+        return 0
+    try:
+        seconds = int(text)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, seconds)
+
+
+def sync_settings_from_props(meta: dict) -> dict:
+    return {
+        "autoSync": parse_auto_sync_prop(meta.get(_PROP_AUTO_SYNC), True),
+        "syncIntervalSec": parse_sync_interval_prop(meta.get(_PROP_SYNC_INTERVAL)),
+    }
+
+
 def read_repo_db(db_path: Path | None = None) -> tuple[list[dict], set[str]]:
     """Return (bindings, deleted_ids) from repo.db.
 
     bindings are Repo rows with worktree/name taken from RepoProperty.
     A name missing there falls back to FileSyncError.repo_name in the same db.
+    Each binding also carries autoSync / syncIntervalSec when present.
     """
     if db_path is None:
         datadir = seafile_datadir()
@@ -431,8 +474,46 @@ def read_repo_db(db_path: Path | None = None) -> tuple[list[dict], set[str]]:
                 break
         if not name:
             name = names.get(rid, "")
-        bindings.append({"id": rid, "name": name, "path": meta.get("worktree") or ""})
+        settings = sync_settings_from_props(meta)
+        bindings.append(
+            {
+                "id": rid,
+                "name": name,
+                "path": meta.get("worktree") or "",
+                "autoSync": settings["autoSync"],
+                "syncIntervalSec": settings["syncIntervalSec"],
+            }
+        )
     return bindings, deleted
+
+
+def read_sync_settings_rpc(client) -> dict[str, dict]:
+    """Map repo_id -> {autoSync, syncIntervalSec} from a live RPC client."""
+    out: dict[str, dict] = {}
+    try:
+        repos = client.get_repo_list(-1, -1) or []
+    except Exception:
+        return out
+    for repo in repos:
+        rid = str(getattr(repo, "id", "") or "")
+        if not rid:
+            continue
+        auto = getattr(repo, "auto_sync", None)
+        if auto is None:
+            try:
+                auto = parse_auto_sync_prop(client.get_repo_property(rid, _PROP_AUTO_SYNC), True)
+            except Exception:
+                auto = True
+        else:
+            auto = bool(auto)
+        try:
+            interval = parse_sync_interval_prop(
+                client.get_repo_property(rid, _PROP_SYNC_INTERVAL)
+            )
+        except Exception:
+            interval = 0
+        out[rid] = {"autoSync": auto, "syncIntervalSec": interval}
+    return out
 
 
 def has_leftover_worktree(bindings: list[dict], deleted_ids: set[str]) -> bool:
@@ -731,7 +812,17 @@ def build_sync_errors(raw_errors: list, repos: list, deleted_ids: set[str]) -> l
     return out
 
 
-def _repo_entry(rid: str, name: str, state: str, path: str, ts: int, error: str = "") -> dict:
+def _repo_entry(
+    rid: str,
+    name: str,
+    state: str,
+    path: str,
+    ts: int,
+    error: str = "",
+    *,
+    auto_sync: bool = True,
+    sync_interval_sec: int = 0,
+) -> dict:
     return {
         "id": rid,
         "name": name,
@@ -739,6 +830,8 @@ def _repo_entry(rid: str, name: str, state: str, path: str, ts: int, error: str 
         "path": path,
         "lastSyncTs": ts,
         "error": error,
+        "autoSync": bool(auto_sync),
+        "syncIntervalSec": int(sync_interval_sec) if sync_interval_sec > 0 else 0,
     }
 
 
@@ -811,6 +904,26 @@ def build_status() -> dict:
     by_id = {str(item.get("id") or ""): item for item in listed if isinstance(item, dict)}
 
     bindings, deleted_ids = read_repo_db()
+    settings_by_id: dict[str, dict] = {
+        str(binding.get("id") or ""): {
+            "autoSync": bool(binding.get("autoSync", True)),
+            "syncIntervalSec": int(binding.get("syncIntervalSec") or 0),
+        }
+        for binding in bindings
+        if binding.get("id")
+    }
+    global_auto_sync = True
+    if running:
+        client = rpc_client()
+        if client is not None:
+            try:
+                global_auto_sync = bool(client.is_auto_sync_enabled())
+            except Exception:
+                global_auto_sync = True
+            rpc_settings = read_sync_settings_rpc(client)
+            if rpc_settings:
+                settings_by_id.update(rpc_settings)
+
     last_by_name = last_sync_from_log()
     # sync-now often returns to synchronized without a log line; pendingSyncTs
     # keeps "last synced" honest until the next logged transition.
@@ -835,7 +948,17 @@ def build_status() -> dict:
             last_sync_ts = ts
         raw_err = str(repo.get("error") or "")
         err = "" if repo_state == "synchronized" else enrich_unknown_error(rid, name, raw_err)
-        entry = _repo_entry(rid, name, repo_state, path, ts, err)
+        settings = settings_by_id.get(rid) or {}
+        entry = _repo_entry(
+            rid,
+            name,
+            repo_state,
+            path,
+            ts,
+            err,
+            auto_sync=bool(settings.get("autoSync", True)),
+            sync_interval_sec=int(settings.get("syncIntervalSec") or 0),
+        )
         if "progress" in repo:
             entry["progress"] = repo.get("progress")
         repos.append(entry)
@@ -855,17 +978,21 @@ def build_status() -> dict:
         for item in listed:
             if not isinstance(item, dict):
                 continue
+            rid = str(item.get("id") or "")
             name = str(item.get("name") or "")
             ts = int(last_by_name.get(name) or 0)
             if ts > last_sync_ts:
                 last_sync_ts = ts
+            settings = settings_by_id.get(rid) or {}
             repos.append(
                 _repo_entry(
-                    str(item.get("id") or ""),
+                    rid,
                     name,
                     fallback_state,
                     str(item.get("path") or ""),
                     ts,
+                    auto_sync=bool(settings.get("autoSync", True)),
+                    sync_interval_sec=int(settings.get("syncIntervalSec") or 0),
                 )
             )
 
@@ -890,6 +1017,8 @@ def build_status() -> dict:
                     cached_state,
                     str(binding.get("path") or ""),
                     ts,
+                    auto_sync=bool(binding.get("autoSync", True)),
+                    sync_interval_sec=int(binding.get("syncIntervalSec") or 0),
                 )
             )
 
@@ -941,6 +1070,7 @@ def build_status() -> dict:
         "snoozeUntil": int(state.get("snoozeUntil") or 0),
         "snoozeLabel": str(state.get("snoozeLabel") or ""),
         "runningDespiteSnooze": running_despite,
+        "globalAutoSync": global_auto_sync,
         "aggregate": aggregate,
         "statusText": status_text,
         "lastSyncTs": last_sync_ts,
@@ -1154,10 +1284,116 @@ def cmd_clear_snooze() -> int:
     return 0
 
 
+def _require_running_client() -> tuple[object | None, str]:
+    if not which_seaf():
+        return None, "seaf-cli not installed"
+    sock_on, _pids = presence()
+    if not sock_on:
+        return None, _DAEMON_REQUIRED
+    client = rpc_client()
+    if client is None:
+        return None, "seafile RPC unavailable; is the daemon running?"
+    return client, ""
+
+
+def _resolve_repo(client, repo_id: str) -> tuple[object | None, str]:
+    rid = (repo_id or "").strip()
+    if not rid:
+        return None, "library id is required"
+    try:
+        repo = client.get_repo(rid)
+    except Exception as exc:  # noqa: BLE001
+        return None, "failed to look up library: %s" % exc
+    if repo is None:
+        return None, "library not found"
+    return repo, ""
+
+
+def cmd_set_auto_sync(repo_id: str, enabled: bool) -> int:
+    client, err = _require_running_client()
+    if client is None:
+        emit({"ok": False, "error": err})
+        return 1
+    repo, err = _resolve_repo(client, repo_id)
+    if repo is None:
+        emit({"ok": False, "error": err})
+        return 1
+    rid = str(getattr(repo, "id", "") or repo_id).strip()
+    value = "true" if enabled else "false"
+    try:
+        code = client.set_repo_property(rid, _PROP_AUTO_SYNC, value)
+    except Exception as exc:  # noqa: BLE001
+        emit({"ok": False, "error": str(exc)})
+        return 1
+    if code not in (0, None):
+        emit({"ok": False, "error": "failed to update auto sync (%s)" % code})
+        return 1
+    # Re-read so the UI sees the daemon's view, not just the write we sent.
+    try:
+        refreshed = client.get_repo(rid)
+        auto = bool(getattr(refreshed, "auto_sync", enabled)) if refreshed else enabled
+    except Exception:
+        auto = enabled
+    try:
+        interval = parse_sync_interval_prop(client.get_repo_property(rid, _PROP_SYNC_INTERVAL))
+    except Exception:
+        interval = 0
+    emit({
+        "ok": True,
+        "id": rid,
+        "autoSync": auto,
+        "syncIntervalSec": interval,
+    })
+    return 0
+
+
+def cmd_set_sync_interval(repo_id: str, seconds: int) -> int:
+    if seconds < 0:
+        emit({"ok": False, "error": "interval must be >= 0"})
+        return 1
+    client, err = _require_running_client()
+    if client is None:
+        emit({"ok": False, "error": err})
+        return 1
+    repo, err = _resolve_repo(client, repo_id)
+    if repo is None:
+        emit({"ok": False, "error": err})
+        return 1
+    rid = str(getattr(repo, "id", "") or repo_id).strip()
+    # 0 = event-driven. Seafile stores the property as a decimal string.
+    value = str(int(seconds))
+    try:
+        code = client.set_repo_property(rid, _PROP_SYNC_INTERVAL, value)
+    except Exception as exc:  # noqa: BLE001
+        emit({"ok": False, "error": str(exc)})
+        return 1
+    if code not in (0, None):
+        emit({"ok": False, "error": "failed to update sync interval (%s)" % code})
+        return 1
+    try:
+        interval = parse_sync_interval_prop(client.get_repo_property(rid, _PROP_SYNC_INTERVAL))
+    except Exception:
+        interval = int(seconds)
+    try:
+        refreshed = client.get_repo(rid)
+        auto = bool(getattr(refreshed, "auto_sync", True)) if refreshed else True
+    except Exception:
+        auto = True
+    emit({
+        "ok": True,
+        "id": rid,
+        "autoSync": auto,
+        "syncIntervalSec": interval,
+    })
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2 or argv[1] in ("-h", "--help"):
         print(
-            "usage: helper.py status|sync-now|pause|resume|snooze <seconds> <label>|clear-snooze",
+            "usage: helper.py status|sync-now|pause|resume|snooze <seconds> <label>"
+            "|clear-snooze|set-auto-sync <repo-id> on|off"
+            "|set-sync-interval <repo-id> <seconds>",
             file=sys.stderr,
         )
         return 2
@@ -1183,6 +1419,29 @@ def main(argv: list[str]) -> int:
             emit({"ok": False, "error": "seconds must be an integer"})
             return 2
         return cmd_snooze(seconds, argv[3])
+    if cmd == "set-auto-sync":
+        if len(argv) < 4:
+            emit({"ok": False, "error": "usage: set-auto-sync <repo-id> on|off"})
+            return 2
+        flag = argv[3].strip().lower()
+        if flag in ("on", "true", "1", "yes"):
+            enabled = True
+        elif flag in ("off", "false", "0", "no"):
+            enabled = False
+        else:
+            emit({"ok": False, "error": "auto sync must be on or off"})
+            return 2
+        return cmd_set_auto_sync(argv[2], enabled)
+    if cmd == "set-sync-interval":
+        if len(argv) < 4:
+            emit({"ok": False, "error": "usage: set-sync-interval <repo-id> <seconds>"})
+            return 2
+        try:
+            seconds = int(argv[3])
+        except ValueError:
+            emit({"ok": False, "error": "seconds must be an integer"})
+            return 2
+        return cmd_set_sync_interval(argv[2], seconds)
 
     emit({"ok": False, "error": "unknown command: %s" % cmd})
     return 2
