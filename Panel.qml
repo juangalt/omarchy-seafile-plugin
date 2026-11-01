@@ -30,6 +30,11 @@ Panel {
   property int libraryIndex: 0
   property bool cursorActive: false
   property bool moreOpen: false
+  property bool syncSettingsOpen: false
+  property string syncSettingsRepoId: ""
+  // back | auto | interval
+  property string syncFocus: "auto"
+  property int syncIntervalIndex: 0
   // Ticking clock so relative "Just now" / snooze countdowns re-evaluate.
   property double nowMs: Date.now()
 
@@ -87,6 +92,8 @@ Panel {
   readonly property var moreActions: {
     var items = []
     if (seafile.installed && seafile.configured) {
+      if (seafile.repos.length > 0)
+        items.push({ id: "syncSettings", label: strings.t("syncSettings"), icon: "󰒓" })
       items.push({ id: "snooze15", label: strings.t("snooze15"), icon: "󰒲" })
       items.push({ id: "snooze1h", label: strings.t("snooze1h"), icon: "󰒲" })
       if (seafile.snoozed)
@@ -95,6 +102,33 @@ Panel {
       items.push({ id: "setup", label: strings.t("setup"), icon: "󰌾" })
     }
     return items
+  }
+
+  readonly property var syncSettingsRepo: {
+    var rid = String(root.syncSettingsRepoId || "")
+    if (rid === "") return null
+    for (var i = 0; i < seafile.repos.length; i++) {
+      var repo = seafile.repos[i]
+      if (repo && String(repo.id || "") === rid) return repo
+    }
+    return null
+  }
+
+  readonly property var syncIntervalChoices: {
+    var presets = Model.syncIntervalPresets()
+    var repo = root.syncSettingsRepo
+    var sec = repo ? Number(repo.syncIntervalSec || 0) : 0
+    if (!isFinite(sec) || sec < 0) sec = 0
+    if (Model.presetIndexForInterval(sec) < 0 && sec > 0) {
+      presets = presets.slice()
+      presets.push({
+        id: "current",
+        seconds: Math.floor(sec),
+        key: "sync.everySeconds",
+        fallback: "Every %1s"
+      })
+    }
+    return presets
   }
 
   function tr(key, fallback) {
@@ -107,9 +141,22 @@ Panel {
       actionIndex = 0
       moreIndex = 0
       libraryIndex = 0
+      syncSettingsOpen = false
+      return
+    }
+    if (syncSettingsOpen) {
+      if (!syncSettingsRepo) {
+        syncSettingsOpen = false
+        focusSection = "header"
+      } else {
+        focusSection = "sync"
+        if (syncIntervalIndex >= syncIntervalChoices.length)
+          syncIntervalIndex = Math.max(0, syncIntervalChoices.length - 1)
+      }
       return
     }
     if (focusSection === "setup") focusSection = "header"
+    if (focusSection === "sync") focusSection = "header"
     if (focusSection === "libraries" && seafile.repos.length === 0) focusSection = "header"
     if (focusSection === "actions" && primaryActions.length === 0) focusSection = "header"
     if (focusSection === "more" && (!moreOpen || moreActions.length === 0)) focusSection = "header"
@@ -118,12 +165,81 @@ Panel {
     if (moreIndex >= moreActions.length) moreIndex = Math.max(0, moreActions.length - 1)
   }
 
+  function openSyncSettings(repoId) {
+    if (!seafile.installed || !seafile.configured || seafile.repos.length === 0) return
+    var id = String(repoId || "")
+    if (id === "") {
+      // Prefer the last focused library even when opened from More (focusSection
+      // is "more" then, so do not require focusSection === "libraries").
+      if (libraryIndex >= 0 && libraryIndex < seafile.repos.length)
+        id = String((seafile.repos[libraryIndex] && seafile.repos[libraryIndex].id) || "")
+      if (id === "") id = String((seafile.repos[0] && seafile.repos[0].id) || "")
+    }
+    if (id === "") return
+    syncSettingsRepoId = id
+    syncSettingsOpen = true
+    moreOpen = false
+    cursorActive = true
+    focusSection = "sync"
+    syncFocus = "auto"
+    var repo = null
+    for (var i = 0; i < seafile.repos.length; i++) {
+      if (String((seafile.repos[i] && seafile.repos[i].id) || "") === id) {
+        repo = seafile.repos[i]
+        break
+      }
+    }
+    var sec = repo ? Number(repo.syncIntervalSec || 0) : 0
+    if (!isFinite(sec) || sec < 0) sec = 0
+    var preset = Model.presetIndexForInterval(sec)
+    if (preset >= 0) syncIntervalIndex = preset
+    else if (sec > 0) syncIntervalIndex = Model.syncIntervalPresets().length
+    else syncIntervalIndex = 0
+    if (panelFlick) panelFlick.contentY = 0
+  }
+
+  function closeSyncSettings() {
+    syncSettingsOpen = false
+    focusSection = "more"
+    moreOpen = true
+    moreIndex = 0
+    cursorActive = true
+  }
+
+  function intervalChoiceLabel(choice) {
+    if (!choice) return ""
+    var label = strings.t(choice.key, choice.fallback)
+    if (String(choice.id || "") === "current" || String(choice.key || "") === "sync.everySeconds")
+      return label.replace("%1", String(choice.seconds || 0))
+    return label
+  }
+
   function moveCursor(dx, dy) {
     cursorActive = true
     ensureCursor()
     if (dy === 0) return
 
     if (focusSection === "setup") return
+
+    if (focusSection === "sync") {
+      if (syncFocus === "back") {
+        if (dy > 0) syncFocus = "auto"
+      } else if (syncFocus === "auto") {
+        if (dy < 0) syncFocus = "back"
+        else if (dy > 0) {
+          syncFocus = "interval"
+          if (syncIntervalIndex < 0) syncIntervalIndex = 0
+        }
+      } else if (syncFocus === "interval") {
+        if (dy < 0 && syncIntervalIndex <= 0) {
+          syncFocus = "auto"
+          syncIntervalIndex = 0
+        } else {
+          syncIntervalIndex = Math.max(0, Math.min(syncIntervalChoices.length - 1, syncIntervalIndex + dy))
+        }
+      }
+      return
+    }
 
     if (focusSection === "header") {
       if (dy > 0) {
@@ -233,6 +349,21 @@ Panel {
       else seafile.runSetup()
       return
     }
+    if (focusSection === "sync") {
+      if (syncFocus === "back") {
+        closeSyncSettings()
+        return
+      }
+      if (syncFocus === "auto") {
+        toggleSyncAuto()
+        return
+      }
+      if (syncFocus === "interval") {
+        applySyncIntervalChoice(syncIntervalIndex)
+        return
+      }
+      return
+    }
     if (focusSection === "header") {
       seafile.toggleRunning()
       return
@@ -242,8 +373,44 @@ Panel {
     else if (focusSection === "more") runAction(moreActions[moreIndex])
   }
 
+  function noteSyncNeedsRunning() {
+    seafile.flashStatus(strings.t("sync.needRunning", "Resume syncing before changing sync settings"))
+  }
+
+  function toggleSyncAuto() {
+    var repo = syncSettingsRepo
+    if (!repo || seafile.busy) {
+      if (seafile.busy) seafile.noteBusy()
+      return
+    }
+    if (!seafile.running) {
+      noteSyncNeedsRunning()
+      return
+    }
+    seafile.setAutoSync(String(repo.id || ""), repo.autoSync === false)
+  }
+
+  function applySyncIntervalChoice(index) {
+    var repo = syncSettingsRepo
+    var choice = syncIntervalChoices[index]
+    if (!repo || !choice) return
+    if (seafile.busy) { seafile.noteBusy(); return }
+    if (!seafile.running) {
+      noteSyncNeedsRunning()
+      return
+    }
+    var seconds = Number(choice.seconds || 0)
+    if (!isFinite(seconds) || seconds < 0) seconds = 0
+    if (Number(repo.syncIntervalSec || 0) === seconds) return
+    seafile.setSyncInterval(String(repo.id || ""), Math.floor(seconds))
+  }
+
   function runAction(action) {
     if (!action) return
+    if (action.id === "syncSettings") {
+      openSyncSettings("")
+      return
+    }
     if (seafile.busy) { seafile.noteBusy(); return }
     switch (action.id) {
     case "sync": seafile.syncNow(); break
@@ -282,6 +449,8 @@ Panel {
   onOpenedChanged: if (opened) {
     cursorActive = false
     moreOpen = false
+    syncSettingsOpen = false
+    syncSettingsRepoId = ""
     libraryIndex = 0
     if (panelFlick) panelFlick.contentY = 0
     ensureCursor()
@@ -376,9 +545,17 @@ Panel {
         root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (root.syncSettingsOpen) root.closeSyncSettings()
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
+        if (root.syncSettingsOpen) {
+          if (t === "a" || t === "A") root.toggleSyncAuto()
+          else if (t === "r" || t === "R") seafile.refresh()
+          return
+        }
         if (t === "r" || t === "R") seafile.refresh()
         else if (t === "s" || t === "S") seafile.syncNow()
         else if (t === "p" || t === "P") seafile.toggleRunning()
@@ -405,9 +582,194 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(12)
 
+          Column {
+            id: syncSettingsColumn
+            visible: root.syncSettingsOpen
+            width: parent.width
+            spacing: Style.space(10)
+
+            CursorSurface {
+              width: parent.width
+              implicitHeight: syncBackRow.implicitHeight + Style.spacing.rowPaddingX
+              hasCursor: root.cursorActive && root.focusSection === "sync" && root.syncFocus === "back"
+              foreground: root.foreground
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: {
+                  root.cursorActive = true
+                  root.focusSection = "sync"
+                  root.syncFocus = "back"
+                }
+                onClicked: root.closeSyncSettings()
+              }
+
+              RowLayout {
+                id: syncBackRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(8)
+
+                PlainText {
+                  text: "󰁍"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.icon
+                }
+                PlainText {
+                  Layout.fillWidth: true
+                  text: strings.t("syncSettings")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+              }
+            }
+
+            PlainText {
+              width: parent.width
+              leftPadding: Style.space(10)
+              rightPadding: Style.space(10)
+              text: root.syncSettingsRepo
+                ? String(root.syncSettingsRepo.name || strings.t("library"))
+                : strings.t("library")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            PlainText {
+              visible: seafile.actionStatus !== "" || seafile.lastError !== ""
+              width: parent.width
+              leftPadding: Style.space(10)
+              rightPadding: Style.space(10)
+              text: seafile.actionStatus !== "" ? seafile.actionStatus : seafile.lastError
+              color: seafile.lastError !== "" ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Item {
+              id: syncAutoBlock
+              width: parent.width
+              implicitHeight: syncAutoRow.implicitHeight + Style.spacing.rowPaddingX
+              readonly property bool ringVisible: root.cursorActive && root.focusSection === "sync" && root.syncFocus === "auto"
+
+              CursorSurface {
+                anchors.fill: parent
+                hasCursor: syncAutoBlock.ringVisible
+                foreground: root.foreground
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.ArrowCursor
+                  onEntered: {
+                    root.cursorActive = true
+                    root.focusSection = "sync"
+                    root.syncFocus = "auto"
+                  }
+                }
+
+                RowLayout {
+                  id: syncAutoRow
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(8)
+
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(1)
+
+                    PlainText {
+                      Layout.fillWidth: true
+                      text: strings.t("sync.autoSync")
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      elide: Text.ElideRight
+                    }
+                    PlainText {
+                      Layout.fillWidth: true
+                      text: strings.t("sync.autoSyncHelp")
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      wrapMode: Text.WordWrap
+                    }
+                  }
+
+                  ToggleSwitch {
+                    id: autoSyncSwitch
+                    checked: root.syncSettingsRepo ? root.syncSettingsRepo.autoSync !== false : true
+                    busy: seafile.busy
+                    hasCursor: false
+                    foreground: root.foreground
+                    onHovered: function(on) {
+                      if (on) {
+                        root.cursorActive = true
+                        root.focusSection = "sync"
+                        root.syncFocus = "auto"
+                      }
+                    }
+                    onToggled: root.toggleSyncAuto()
+                  }
+                }
+              }
+            }
+
+            PlainText {
+              width: parent.width
+              leftPadding: Style.space(10)
+              rightPadding: Style.space(10)
+              text: strings.t("sync.checkForChanges")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            PlainText {
+              width: parent.width
+              leftPadding: Style.space(10)
+              rightPadding: Style.space(10)
+              text: strings.t("sync.checkForChangesHelp")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(2)
+
+              Repeater {
+                model: root.syncIntervalChoices
+                SyncIntervalRow {
+                  required property var modelData
+                  required property int index
+                  width: parent.width
+                  choice: modelData
+                  rowIndex: index
+                }
+              }
+            }
+          }
+
           Item {
             id: header
-            visible: seafile.installed && seafile.configured
+            visible: !root.syncSettingsOpen && seafile.installed && seafile.configured
             width: parent.width
             implicitHeight: hero.implicitHeight
             readonly property bool ringVisible: root.headerHasCursor
@@ -449,7 +811,7 @@ Panel {
           }
 
           PlainText {
-            visible: seafile.actionStatus !== "" || seafile.lastError !== ""
+            visible: !root.syncSettingsOpen && (seafile.actionStatus !== "" || seafile.lastError !== "")
             width: parent.width
             text: seafile.actionStatus !== "" ? seafile.actionStatus : seafile.lastError
             color: seafile.lastError !== "" ? root.urgent : root.dim
@@ -459,12 +821,12 @@ Panel {
           }
 
           SetupCard {
-            visible: !seafile.installed || !seafile.configured
+            visible: !root.syncSettingsOpen && (!seafile.installed || !seafile.configured)
             width: parent.width
           }
 
           Column {
-            visible: seafile.installed && seafile.configured
+            visible: !root.syncSettingsOpen && seafile.installed && seafile.configured
             width: parent.width
             spacing: Style.space(6)
 
@@ -499,7 +861,7 @@ Panel {
           }
 
           Column {
-            visible: seafile.installed && seafile.configured && root.primaryActions.length > 0
+            visible: !root.syncSettingsOpen && seafile.installed && seafile.configured && root.primaryActions.length > 0
             width: parent.width
             spacing: Style.space(4)
 
@@ -517,12 +879,12 @@ Panel {
           }
 
           PanelSeparator {
-            visible: seafile.installed && seafile.configured
+            visible: !root.syncSettingsOpen && seafile.installed && seafile.configured
             foreground: root.foreground
           }
 
           Column {
-            visible: seafile.installed && seafile.configured
+            visible: !root.syncSettingsOpen && seafile.installed && seafile.configured
             width: parent.width
             spacing: Style.space(4)
 
@@ -698,6 +1060,70 @@ Panel {
         wrapMode: Text.WordWrap
         maximumLineCount: 3
         elide: Text.ElideRight
+      }
+    }
+  }
+
+  component SyncIntervalRow: CursorSurface {
+    id: intervalRow
+    property var choice: null
+    property int rowIndex: 0
+
+    readonly property int choiceSeconds: {
+      var sec = Number(intervalRow.choice ? intervalRow.choice.seconds : 0)
+      return isFinite(sec) && sec > 0 ? Math.floor(sec) : 0
+    }
+    readonly property bool selected: {
+      var repo = root.syncSettingsRepo
+      var current = repo ? Number(repo.syncIntervalSec || 0) : 0
+      if (!isFinite(current) || current < 0) current = 0
+      return Math.floor(current) === intervalRow.choiceSeconds
+    }
+
+    hasCursor: root.cursorActive
+      && root.focusSection === "sync"
+      && root.syncFocus === "interval"
+      && root.syncIntervalIndex === rowIndex
+    foreground: root.foreground
+    implicitHeight: intervalContent.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: seafile.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
+      enabled: !seafile.busy
+      onEntered: {
+        root.cursorActive = true
+        root.focusSection = "sync"
+        root.syncFocus = "interval"
+        root.syncIntervalIndex = intervalRow.rowIndex
+      }
+      onClicked: root.applySyncIntervalChoice(intervalRow.rowIndex)
+    }
+
+    RowLayout {
+      id: intervalContent
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(8)
+
+      PlainText {
+        Layout.fillWidth: true
+        text: root.intervalChoiceLabel(intervalRow.choice)
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+      }
+      PlainText {
+        visible: intervalRow.selected
+        text: "󰄬"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
       }
     }
   }

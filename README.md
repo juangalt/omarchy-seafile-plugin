@@ -54,6 +54,7 @@ Removal deletes the plugin checkout. It does not uninstall the `seafile` package
 | --- | --- |
 | Pause | Stops the Seafile daemon (and your user `seaf-daemon.service` if present) |
 | Snooze 15m / 1h | Pause, then auto-resume |
+| Sync settings | Per-library auto sync and check interval (on change, or poll every N minutes) |
 | Connect / repair | Terminal wizard under **More** — re-attach a leftover binding (password only when needed), or a full sign-in |
 
 Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `https://` if you omit it, and asks before using cleartext HTTP.
@@ -88,7 +89,8 @@ The Connect wizard runs `seaf-cli` through a small wrapper that sends a normal b
 ## Important
 
 - **One Seafile client.** Do not run `seafile-client` (GUI) alongside this. Both use the same data directory and will fight.
-- **Pause stops the whole daemon**, not a single library.
+- **Pause stops the whole daemon**, not a single library. To pause one library only, use **More → Sync settings → Auto sync**.
+- **On change** is the normal mode for local folders. Use a poll interval only for network mounts where filesystem events are unreliable.
 - Prefer a full URL with scheme. LAN HTTP is allowed after an explicit confirm.
 - After logout or reboot during an active upload, open **Connect / repair** if the bar says the library is unbound — re-attach the same folder; do not download into a new empty path unless you intend a fresh copy.
 

@@ -221,6 +221,49 @@ class HelperUnit(unittest.TestCase):
                 )
             )
 
+    def test_parse_auto_sync_and_interval(self):
+        self.assertTrue(helper.parse_auto_sync_prop(None))
+        self.assertTrue(helper.parse_auto_sync_prop("true"))
+        self.assertFalse(helper.parse_auto_sync_prop("false"))
+        self.assertFalse(helper.parse_auto_sync_prop("0"))
+        # Bare "1" is ambiguous on some Seafile builds — keep default.
+        self.assertTrue(helper.parse_auto_sync_prop("1"))
+        self.assertEqual(helper.parse_sync_interval_prop(None), 0)
+        self.assertEqual(helper.parse_sync_interval_prop(""), 0)
+        self.assertEqual(helper.parse_sync_interval_prop("0"), 0)
+        self.assertEqual(helper.parse_sync_interval_prop("300"), 300)
+        self.assertEqual(helper.parse_sync_interval_prop("-5"), 0)
+
+    def test_sync_settings_from_props(self):
+        settings = helper.sync_settings_from_props(
+            {"auto-sync": "false", "sync-interval": "60"}
+        )
+        self.assertFalse(settings["autoSync"])
+        self.assertEqual(settings["syncIntervalSec"], 60)
+
+    def test_repo_entry_includes_sync_settings(self):
+        entry = helper._repo_entry(
+            "id",
+            "vault",
+            "synchronized",
+            "/tmp/vault",
+            1,
+            auto_sync=False,
+            sync_interval_sec=900,
+        )
+        self.assertFalse(entry["autoSync"])
+        self.assertEqual(entry["syncIntervalSec"], 900)
+
+    def test_set_auto_sync_requires_daemon(self):
+        with mock.patch.object(helper, "which_seaf", return_value="/usr/bin/seaf-cli"):
+            with mock.patch.object(helper, "presence", return_value=(False, [])):
+                with mock.patch.object(helper, "emit") as emit:
+                    code = helper.cmd_set_auto_sync("repo", True)
+        self.assertEqual(code, 1)
+        payload = emit.call_args[0][0]
+        self.assertFalse(payload["ok"])
+        self.assertIn("resume syncing", payload["error"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

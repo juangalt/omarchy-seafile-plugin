@@ -25,7 +25,8 @@
       {
         "key": "refreshIntervalSec",
         "type": "integer",
-        "label": "Refresh interval (seconds)",
+        "label": "Status refresh (seconds)",
+        "description": "How often the bar re-checks Seafile status. This is not the library sync interval — set that under Sync settings in the panel.",
         "min": 5,
         "max": 3600,
         "step": 5,
