@@ -163,6 +163,61 @@ else:
         with self.assertRaisesRegex(RuntimeError, "RPC unavailable"):
             helper.bounded_rpc_call(broken, 1)
 
+    def _stalled_worker_survives(self, sig, install_handlers):
+        import signal
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "worker.pid"
+            code = f"""
+import importlib.util, os, time
+spec = importlib.util.spec_from_file_location("h", {str(ROOT / "helper.py")!r})
+h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
+{"h.install_termination_handlers()" if install_handlers else ""}
+def stall():
+    open({str(pidfile)!r}, "w").write(str(os.getpid()))
+    time.sleep(60)
+h.bounded_rpc_call(stall, 30)
+"""
+            parent = subprocess.Popen([sys.executable, "-c", code], cwd=ROOT)
+            try:
+                deadline = time.monotonic() + 5
+                while not pidfile.exists() or not pidfile.read_text():
+                    self.assertLess(time.monotonic(), deadline, "worker never started")
+                    time.sleep(0.02)
+                worker = int(pidfile.read_text())
+                parent.send_signal(sig)
+                parent.wait(timeout=5)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(worker, 0)
+                    except ProcessLookupError:
+                        return False
+                    # A zombie still answers kill(0); treat it as gone.
+                    try:
+                        state = Path(f"/proc/{worker}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                    except OSError:
+                        return False
+                    if state == "Z":
+                        return False
+                    time.sleep(0.05)
+                os.kill(worker, signal.SIGKILL)
+                return True
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+
+    def test_rpc_worker_reaped_when_parent_sigterm(self):
+        import signal
+
+        self.assertFalse(self._stalled_worker_survives(signal.SIGTERM, True))
+
+    def test_rpc_worker_reaped_when_parent_sigkill(self):
+        import signal
+
+        self.assertFalse(self._stalled_worker_survives(signal.SIGKILL, False))
+
     def test_status_keeps_cached_settings_when_live_rpc_hangs(self):
         import time
 

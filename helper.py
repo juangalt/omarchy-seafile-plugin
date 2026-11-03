@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -349,16 +350,62 @@ def rpc_client():
         return None
 
 
+_ACTIVE_RPC_WORKERS: set = set()
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent() -> None:
+    """Ask the kernel to SIGKILL this worker if the parent exits for any reason.
+
+    Covers the parent being killed without running its cleanup (e.g. SIGKILL
+    from the QML watchdog). Best effort: non-Linux or a missing libc is a no-op.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reap_rpc_workers() -> None:
+    for process in list(_ACTIVE_RPC_WORKERS):
+        try:
+            if process.is_alive():
+                process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _on_terminate(signum, _frame) -> None:
+    # SIGTERM from the QML watchdog would otherwise skip the `finally` in
+    # bounded_rpc_call and strand the active worker.
+    _reap_rpc_workers()
+    os._exit(128 + signum)
+
+
+def install_termination_handlers() -> None:
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _on_terminate)
+        except (ValueError, OSError):
+            pass
+
+
 def bounded_rpc_call(call, timeout: float):
     """Run RPC work in a disposable process; a timeout leaves no live worker.
 
     Omarchy runs on Linux. Fork also keeps imported Seafile bindings and local
-    callables available without requiring them to be pickleable.
+    callables available without requiring them to be pickleable. Workers die
+    with the parent (PDEATHSIG) and are killed by the parent's SIGTERM handler,
+    so an outer watchdog termination cannot leave one blocked.
     """
     context = multiprocessing.get_context("fork")
     reader, writer = context.Pipe(duplex=False)
 
     def worker():
+        _die_with_parent()
         reader.close()
         try:
             writer.send((True, call()))
@@ -370,6 +417,7 @@ def bounded_rpc_call(call, timeout: float):
     process = context.Process(target=worker, daemon=True)
     try:
         process.start()
+        _ACTIVE_RPC_WORKERS.add(process)
         writer.close()
         if not reader.poll(timeout):
             raise TimeoutError("seafile RPC timed out after %.1fs" % timeout)
@@ -390,6 +438,7 @@ def bounded_rpc_call(call, timeout: float):
             if process.is_alive():
                 process.kill()
                 process.join()
+            _ACTIVE_RPC_WORKERS.discard(process)
             process.close()
 
 
@@ -1437,6 +1486,7 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
+    install_termination_handlers()
     cmd = argv[1]
     if cmd == "status":
         return cmd_status()
