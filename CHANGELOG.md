@@ -2,6 +2,7 @@
 
 ## 0.2.0
 
+- Rename the plugin to Seafile Sync and refresh the marketplace hero preview.
 - Add per-library auto sync and sync interval controls, including the last focused library from More.
 - Improve Connect / repair to reuse saved identity and request only a password when necessary; force editing invalid saved server URLs.
 - Keep account tokens and encrypted library passwords out of process arguments.

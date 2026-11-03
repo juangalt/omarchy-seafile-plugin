@@ -1,4 +1,4 @@
-# Seafile for Omarchy
+# Seafile Sync for Omarchy
 
 A bar widget for [Seafile](https://www.seafile.com/) on [Omarchy](https://omarchy.org/).
 
@@ -8,7 +8,7 @@ It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze
 
 ## Preview
 
-![Seafile for Omarchy](preview.png)
+![Seafile Sync for Omarchy](preview.png)
 
 ![Panel](docs/preview-alts/05-panel-portrait.png)
 

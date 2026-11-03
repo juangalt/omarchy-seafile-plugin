@@ -1,5 +1,5 @@
 {
-  "title": "Seafile",
+  "title": "Seafile Sync",
   "meta.notInstalled": "Install seaf-cli to get started",
   "meta.notConfigured": "Connect your Seafile server",
   "meta.paused": "Syncing paused",

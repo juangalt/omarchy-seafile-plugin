@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "juangalt.seafile",
-  "name": "Seafile",
+  "name": "Seafile Sync",
   "version": "0.2.0",
   "author": "juangalt",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Seafile",
+    "displayName": "Seafile Sync",
     "description": "Watch Seafile libraries, sync now, pause or snooze, and open your synced folder.",
     "category": "Files",
     "allowMultiple": false,
