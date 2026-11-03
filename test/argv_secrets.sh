@@ -439,6 +439,9 @@ accept_repair_server "https://seafile.example.test"
 # https:// alone normalizes/validates as missing host.
 bash -c '
 source "$1"
+LOG_DIR=$2
+LOG_FILE=$LOG_DIR/setup.log
+ensure_log
 gum() {
   case "$1" in
     confirm)
@@ -454,6 +457,6 @@ gum() {
 server=""
 accept_repair_server "https://"
 [[ $server == "https://fixed.example.test" ]] || exit 2
-' _ "$ROOT/scripts/setup.sh" || die "accept_repair_server should force edit for an invalid saved URL"
+' _ "$ROOT/scripts/setup.sh" "$TMP/repair-log" || die "accept_repair_server should force edit for an invalid saved URL"
 
 say "argv secret checks passed"

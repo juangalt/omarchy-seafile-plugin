@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "juangalt.seafile",
   "name": "Seafile",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "juangalt",
   "license": "MIT",
   "description": "Seafile sync status, pause/snooze, and setup for seaf-cli in the Omarchy bar.",

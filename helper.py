@@ -7,6 +7,7 @@ Commands print a single JSON object on stdout. Log/diagnostic strings stay Engli
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -346,6 +347,61 @@ def rpc_client():
         return SeafileRpcClient(str(sock))
     except Exception:
         return None
+
+
+def bounded_rpc_call(call, timeout: float):
+    """Run RPC work in a disposable process; a timeout leaves no live worker.
+
+    Omarchy runs on Linux. Fork also keeps imported Seafile bindings and local
+    callables available without requiring them to be pickleable.
+    """
+    context = multiprocessing.get_context("fork")
+    reader, writer = context.Pipe(duplex=False)
+
+    def worker():
+        reader.close()
+        try:
+            writer.send((True, call()))
+        except Exception as exc:
+            writer.send((False, str(exc)))
+        finally:
+            writer.close()
+
+    process = context.Process(target=worker, daemon=True)
+    try:
+        process.start()
+        writer.close()
+        if not reader.poll(timeout):
+            raise TimeoutError("seafile RPC timed out after %.1fs" % timeout)
+        try:
+            ok, result = reader.recv()
+        except EOFError as exc:
+            raise RuntimeError("seafile RPC worker exited without a result") from exc
+        if not ok:
+            raise RuntimeError(result)
+        return result
+    finally:
+        reader.close()
+        writer.close()
+        if process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=0.5)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            process.close()
+
+
+def live_sync_settings() -> tuple[bool, dict]:
+    client = rpc_client()
+    if client is None:
+        return True, {}
+    try:
+        enabled = bool(client.is_auto_sync_enabled())
+    except Exception:
+        enabled = True
+    return enabled, read_sync_settings_rpc(client)
 
 
 def parse_status_json(raw: str) -> dict:
@@ -914,15 +970,13 @@ def build_status() -> dict:
     }
     global_auto_sync = True
     if running:
-        client = rpc_client()
-        if client is not None:
-            try:
-                global_auto_sync = bool(client.is_auto_sync_enabled())
-            except Exception:
-                global_auto_sync = True
-            rpc_settings = read_sync_settings_rpc(client)
-            if rpc_settings:
-                settings_by_id.update(rpc_settings)
+        try:
+            # Bound the entire snapshot, independent of library count. A stuck
+            # settings call must not prevent sync-now from reaching recovery.
+            global_auto_sync, rpc_settings = bounded_rpc_call(live_sync_settings, 3.0)
+            settings_by_id.update(rpc_settings)
+        except (TimeoutError, RuntimeError, OSError):
+            pass  # Keep the settings already read from repo.db.
 
     last_by_name = last_sync_from_log()
     # sync-now often returns to synchronized without a log line; pendingSyncTs
@@ -1088,23 +1142,8 @@ def cmd_status() -> int:
 
 
 def _rpc_sync(client, repo_id: str, timeout: float = 20.0) -> None:
-    """Call seafile RPC sync with a hard timeout so control never hangs forever.
-
-    Do not use ThreadPoolExecutor as a context manager: on timeout its
-    ``shutdown(wait=True)`` would block until the hung RPC finishes.
-    """
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-
-    pool = ThreadPoolExecutor(max_workers=1)
-    try:
-        fut = pool.submit(client.sync, repo_id, "")
-        try:
-            fut.result(timeout=timeout)
-        except FuturesTimeout as exc:
-            fut.cancel()
-            raise TimeoutError("seafile sync RPC timed out after %.0fs" % timeout) from exc
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+    """Call sync with a hard timeout, terminating hung RPC work on expiry."""
+    bounded_rpc_call(lambda: client.sync(repo_id, ""), timeout)
 
 
 def _sync_repos(client, repos: list) -> tuple[int, list[str]]:

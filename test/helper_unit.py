@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -133,6 +134,61 @@ class HelperUnit(unittest.TestCase):
                 sock.write_text("")
                 with mock.patch.object(helper, "owning_daemon_pids", return_value=[]):
                     self.assertTrue(helper._wait_until_up(0.3))
+
+    def test_rpc_timeout_does_not_delay_process_exit(self):
+        code = """
+import helper, time, multiprocessing
+class Hung:
+    def sync(self, *args):
+        time.sleep(60)
+try:
+    helper._rpc_sync(Hung(), 'repo', timeout=0.1)
+except TimeoutError:
+    assert not multiprocessing.active_children()
+else:
+    raise AssertionError('expected timeout')
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=ROOT,
+            capture_output=True, text=True, timeout=3,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bounded_rpc_result_and_error(self):
+        self.assertEqual(helper.bounded_rpc_call(lambda: {"value": 42}, 1), {"value": 42})
+
+        def broken():
+            raise ValueError("RPC unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "RPC unavailable"):
+            helper.bounded_rpc_call(broken, 1)
+
+    def test_status_keeps_cached_settings_when_live_rpc_hangs(self):
+        import time
+
+        def hung_settings():
+            time.sleep(60)
+
+        bounded = helper.bounded_rpc_call
+        repo = {"id": "repo", "name": "vault", "state": "synchronized"}
+        binding = {"id": "repo", "autoSync": False, "syncIntervalSec": 900}
+        probe = helper.Probe("running", 0, json.dumps({"repos": [repo]}), "", True, ())
+        with (
+            mock.patch.object(helper, "which_seaf", return_value="seaf-cli"),
+            mock.patch.object(helper, "load_state", return_value={}),
+            mock.patch.object(helper, "probe_status", return_value=probe),
+            mock.patch.object(helper, "run", return_value=(0, "[]", "")),
+            mock.patch.object(helper, "read_repo_db", return_value=([binding], set())),
+            mock.patch.object(helper, "last_sync_from_log", return_value={}),
+            mock.patch.object(helper, "seafile_datadir", return_value=None),
+            mock.patch.object(helper, "live_sync_settings", hung_settings),
+            mock.patch.object(helper, "bounded_rpc_call", side_effect=lambda call, timeout: bounded(call, 0.1)),
+        ):
+            started = time.monotonic()
+            status = helper.build_status()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertFalse(status["repos"][0]["autoSync"])
+        self.assertEqual(status["repos"][0]["syncIntervalSec"], 900)
 
     def test_pending_sync_ts_beats_stale_log(self):
         self.assertEqual(helper.aggregate_state([{"state": "synchronized"}]), "synchronized")

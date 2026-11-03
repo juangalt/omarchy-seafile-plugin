@@ -28,6 +28,10 @@ omarchy plugin add git@github.com:juangalt/omarchy-seafile-plugin.git --enable
 
 Requires the [`seafile`](https://archlinux.org/packages/extra/x86_64/seafile/) package (`seaf-cli`). The panel can install it with `yay` if it is missing.
 
+Runtime dependencies are Omarchy's Quickshell shell and shared `qs.Commons` / `qs.Ui` components, Bash, Python 3, `seaf-cli`, and the Python `seafile` and `pysearpc` modules. Connect / repair also uses `gum`, `sqlite3`, GNU coreutils (including `timeout`), `awk`, `grep`, `sed`, and `setsid` from util-linux. Opening folders uses `xdg-open`; viewing logs uses `less`. These tools are normally available on Omarchy; `yay` is needed only for the panel's optional Seafile package installer.
+
+The plugin uses the English translation catalog as a fallback for other Omarchy languages.
+
 ---
 
 ## Remove
@@ -38,6 +42,8 @@ omarchy plugin remove juangalt.seafile
 ```
 
 Removal deletes the plugin checkout. It does not uninstall the `seafile` package or erase `~/.seafile-client` library data.
+
+Disabling or removing the plugin leaves the daemon in its current state. Resume a paused or snoozed client before removal, or run `seaf-cli start` afterward; the plugin cannot wake an expired snooze while disabled.
 
 ---
 
@@ -93,6 +99,12 @@ The Connect wizard runs `seaf-cli` through a small wrapper that sends a normal b
 - **On change** is the normal mode for local folders. Use a poll interval only for network mounts where filesystem events are unreliable.
 - Prefer a full URL with scheme. LAN HTTP is allowed after an explicit confirm.
 - After logout or reboot during an active upload, open **Connect / repair** if the bar says the library is unbound — re-attach the same folder; do not download into a new empty path unless you intend a fresh copy.
+
+## Files and network access
+
+The enabled widget checks local Seafile status every 15 seconds by default (configurable from 5 to 3600 seconds), with additional local checks after actions and during snooze. Status checks read the client configuration, library database, and log; they do not make direct server requests. The Seafile daemon handles network syncing according to its library settings.
+
+Connect / repair contacts the server you select to authenticate and list or attach libraries. It initializes client metadata when needed, repairs the client ID, and can clear a stuck clone task for the selected library. Pause and resume control the current user's Seafile daemon and `seaf-daemon.service` when present. Plugin state and setup logs live under `~/.local/state/omarchy/plugins/juangalt.seafile/`; client metadata lives under `~/.ccnet` and `~/.seafile-client`. Removing the plugin preserves these directories and synced folders.
 
 ---
 
