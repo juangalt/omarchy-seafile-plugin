@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "author": "juangalt",
   "license": "MIT",
-  "description": "Seafile sync status, pause/snooze, and setup for seaf-cli in the Omarchy bar.",
+  "description": "Monitor and control Seafile from your Omarchy bar: sync status, pause and snooze, per-library settings, and guided setup.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Seafile Sync",
-    "description": "Watch Seafile libraries, sync now, pause or snooze, and open your synced folder.",
+    "description": "Check library status, sync on demand, pause or snooze, adjust sync settings, and open folders or logs.",
     "category": "Files",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -26,7 +26,7 @@
         "key": "refreshIntervalSec",
         "type": "integer",
         "label": "Status refresh (seconds)",
-        "description": "How often the bar re-checks Seafile status. This is not the library sync interval — set that under Sync settings in the panel.",
+        "description": "How often the widget checks local status. To change how often a library syncs, open Sync settings in the panel.",
         "min": 5,
         "max": 3600,
         "step": 5,

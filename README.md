@@ -1,8 +1,17 @@
 # Seafile Sync for Omarchy
 
-A bar widget for [Seafile](https://www.seafile.com/) on [Omarchy](https://omarchy.org/).
+Monitor and control [Seafile](https://www.seafile.com/) from your [Omarchy](https://omarchy.org/) bar. Check library status, sync on demand, and manage automatic syncing from one panel.
 
-It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze, open the library folder, view logs, and a terminal wizard to connect or repair a library binding.
+Seafile Sync builds on Seafile's command-line client (`seaf-cli`) with desktop controls for everyday use and a guided terminal wizard for connecting libraries and repairing broken connections.
+
+## Features
+
+- **Status at a glance:** see sync activity, paused libraries, errors, and when a library last synced.
+- **Sync when you need it:** request a sync from the panel or middle-click the bar icon. Sync now also attempts to recover a stuck daemon.
+- **Pause or snooze:** pause all syncing, resume it, or take a 15-minute or one-hour break with automatic resume while the plugin is enabled.
+- **Per-library controls:** enable or disable automatic syncing and choose between syncing on change or at a set interval.
+- **Folders and logs within reach:** open a library's local folder or inspect the Seafile log from the panel.
+- **Guided connection and repair:** connect a server, choose a library, or reattach an existing folder using saved account details where available. Supports accounts with 2FA and encrypted libraries.
 
 ---
 
@@ -10,7 +19,7 @@ It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze
 
 ![Seafile Sync for Omarchy](preview.png)
 
-![Panel](docs/preview-alts/05-panel-portrait.png)
+![Seafile library status and controls](docs/preview-alts/05-panel-portrait.png)
 
 ---
 
@@ -20,7 +29,7 @@ It sits on top of `seaf-cli`: live status in the bar, sync now, pause and snooze
 omarchy plugin add https://github.com/juangalt/omarchy-seafile-plugin.git --enable
 ```
 
-SSH also works if you prefer keys over HTTPS:
+To install using your GitHub SSH key:
 
 ```bash
 omarchy plugin add git@github.com:juangalt/omarchy-seafile-plugin.git --enable
@@ -54,14 +63,14 @@ Disabling or removing the plugin leaves the daemon in its current state. Resume 
 | Left-click | Open the panel |
 | Middle-click | Sync now (also restarts a stuck daemon) |
 | Right-click | Refresh status |
-| `s` / `p` | Sync now / pause·resume (panel focused) |
+| `s` / `p` | Sync now / pause or resume (main panel focused) |
 
 | Control | Behavior |
 | --- | --- |
 | Pause | Stops the Seafile daemon (and your user `seaf-daemon.service` if present) |
 | Snooze 15m / 1h | Pause, then auto-resume |
 | Sync settings | Per-library auto sync and check interval (on change, or poll every N minutes) |
-| Connect / repair | Terminal wizard under **More** — re-attach a leftover binding (password only when needed), or a full sign-in |
+| Connect / repair | Guided terminal setup under **More** — connect a library or reattach an existing folder |
 
 Server URLs need a scheme (`https://…` or `http://…`). The wizard adds `https://` if you omit it, and asks before using cleartext HTTP.
 
@@ -80,13 +89,13 @@ Setup log (directory mode `700`, file mode `600`):
 
 `~/.local/state/omarchy/plugins/juangalt.seafile/setup.log`
 
-The account password is never stored. Login yields a short-lived account token handed to `seaf-cli` in a mode-`600` config file (`-C`), not as `-T`. An encrypted library password is written to `seaf-cli`'s stdin, not as `-e`. Neither is written to the log. Account email and server URL may be.
+The wizard does not save your account password. It passes the login token to `seaf-cli` through a temporary, owner-only config file and removes that file on exit. Encrypted library passwords are passed through stdin. These credentials stay out of process arguments and setup logs; the account email and server URL may appear in logs. Seafile retains its own library authentication metadata in the client database.
 
 ---
 
 ## Cloudflare and public hosts
 
-Hosts behind Cloudflare (for example `https://seafile.zombie.enterprises`) sometimes block Python’s default User-Agent with error **1010**.
+Some hosts behind Cloudflare block Python's default User-Agent with error **1010**.
 
 The Connect wizard runs `seaf-cli` through a small wrapper that sends a normal browser User-Agent for API calls (login, list-remote, download-info). The daemon’s own file transfer uses Seafile’s native client headers — that path does not need the wrapper.
 
@@ -94,7 +103,7 @@ The Connect wizard runs `seaf-cli` through a small wrapper that sends a normal b
 
 ## Important
 
-- **One Seafile client.** Do not run `seafile-client` (GUI) alongside this. Both use the same data directory and will fight.
+- **Use one client at a time.** Running the Seafile GUI alongside this plugin can cause conflicts because both use the same client data directory.
 - **Pause stops the whole daemon**, not a single library. To pause one library only, use **More → Sync settings → Auto sync**.
 - **On change** is the normal mode for local folders. Use a poll interval only for network mounts where filesystem events are unreliable.
 - Prefer a full URL with scheme. LAN HTTP is allowed after an explicit confirm.
