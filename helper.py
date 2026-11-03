@@ -354,7 +354,7 @@ _ACTIVE_RPC_WORKERS: set = set()
 _PR_SET_PDEATHSIG = 1
 
 
-def _die_with_parent() -> None:
+def _die_with_parent(parent_pid: int) -> None:
     """Ask the kernel to SIGKILL this worker if the parent exits for any reason.
 
     Covers the parent being killed without running its cleanup (e.g. SIGKILL
@@ -367,6 +367,10 @@ def _die_with_parent() -> None:
         libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
     except Exception:  # noqa: BLE001
         pass
+    # The parent may have died between fork and prctl; PDEATHSIG would then
+    # never fire because we were already reparented.
+    if os.getppid() != parent_pid:
+        os._exit(1)
 
 
 def _reap_rpc_workers() -> None:
@@ -403,9 +407,10 @@ def bounded_rpc_call(call, timeout: float):
     """
     context = multiprocessing.get_context("fork")
     reader, writer = context.Pipe(duplex=False)
+    parent_pid = os.getpid()
 
     def worker():
-        _die_with_parent()
+        _die_with_parent(parent_pid)
         reader.close()
         try:
             writer.send((True, call()))
@@ -1195,7 +1200,14 @@ def _rpc_sync(client, repo_id: str, timeout: float = 20.0) -> None:
     bounded_rpc_call(lambda: client.sync(repo_id, ""), timeout)
 
 
-def _sync_repos(client, repos: list) -> tuple[int, list[str]]:
+# Whole sync-now budget; must stay under the 45s QML helper watchdog so the
+# helper reports per-library timeouts instead of being killed mid-flight.
+SYNC_NOW_BUDGET = 38.0
+# Minimum time left before attempting a daemon restart + second sync pass.
+SYNC_RETRY_MIN_REMAINING = 12.0
+
+
+def _sync_repos(client, repos: list, deadline: float | None = None) -> tuple[int, list[str]]:
     synced = 0
     errors: list[str] = []
     for repo in repos:
@@ -1204,8 +1216,14 @@ def _sync_repos(client, repos: list) -> tuple[int, list[str]]:
         rid = str(repo.get("id") or "")
         if not rid:
             continue
+        timeout = 20.0
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout < 0.5:
+                errors.append("%s: sync-now budget exhausted (timed out)" % (repo.get("name") or rid))
+                continue
         try:
-            _rpc_sync(client, rid)
+            _rpc_sync(client, rid, timeout)
             synced += 1
         except Exception as exc:  # noqa: BLE001 — surface to UI
             errors.append("%s: %s" % (repo.get("name") or rid, exc))
@@ -1224,6 +1242,7 @@ def cmd_sync_now() -> int:
     if not which_seaf():
         emit({"ok": False, "error": "seaf-cli not installed"})
         return 1
+    deadline = time.monotonic() + SYNC_NOW_BUDGET
 
     # Clear snooze before status so a sync request does not stop the daemon first.
     if int(load_state().get("snoozeUntil") or 0) > 0:
@@ -1267,7 +1286,7 @@ def cmd_sync_now() -> int:
         status = build_status()
         repos = status.get("repos") or []
 
-    synced, errors = _sync_repos(client, repos)
+    synced, errors = _sync_repos(client, repos, deadline)
 
     # One recovery retry: hung RPC, or libraries still wedged after the request.
     retry = False
@@ -1276,6 +1295,9 @@ def cmd_sync_now() -> int:
     elif synced > 0 and status_needs_recovery(build_status()):
         retry = True
 
+    if retry and not recovered and deadline - time.monotonic() < SYNC_RETRY_MIN_REMAINING:
+        # Not enough budget left for restart + resync before the UI watchdog.
+        retry = False
     if retry and not recovered:
         ok, err = restart_daemon()
         if ok:
@@ -1292,7 +1314,7 @@ def cmd_sync_now() -> int:
                 return 1
             status = build_status()
             repos = status.get("repos") or []
-            synced, errors = _sync_repos(client, repos)
+            synced, errors = _sync_repos(client, repos, deadline)
         elif not synced:
             emit({
                 "ok": False,

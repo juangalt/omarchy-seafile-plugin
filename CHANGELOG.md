@@ -9,6 +9,7 @@
 - Recover stuck daemons from Sync now and improve status settling.
 - Bound live sync-settings reads and preserve cached settings if RPC stalls.
 - Terminate and reap timed-out sync RPC workers so helpers can exit promptly.
+- Kill sync RPC workers when the helper is terminated or dies, and keep Sync now within the bar watchdog budget.
 - Isolate repair tests from user logs and cover timeout cleanup and cached-settings fallback.
 
 ## 0.1.0

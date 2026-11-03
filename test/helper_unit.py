@@ -218,6 +218,26 @@ h.bounded_rpc_call(stall, 30)
 
         self.assertFalse(self._stalled_worker_survives(signal.SIGKILL, False))
 
+    def test_sync_repos_respects_overall_deadline(self):
+        import time
+
+        class Hung:
+            def sync(self, _repo_id, _password):
+                time.sleep(60)
+
+        repos = [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}, {"id": "c", "name": "C"}]
+        start = time.monotonic()
+        synced, errors = helper._sync_repos(Hung(), repos, start + 1.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual(synced, 0)
+        self.assertEqual(len(errors), 3)
+        self.assertLess(elapsed, 2.5)
+        self.assertTrue(helper._errors_look_transient(errors))
+
+    def test_sync_now_budget_fits_ui_watchdog(self):
+        # Service.qml helperWatchdog allows 45s for control helpers.
+        self.assertLess(helper.SYNC_NOW_BUDGET, 45.0)
+
     def test_status_keeps_cached_settings_when_live_rpc_hangs(self):
         import time
 
