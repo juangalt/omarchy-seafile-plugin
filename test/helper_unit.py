@@ -163,6 +163,81 @@ else:
         with self.assertRaisesRegex(RuntimeError, "RPC unavailable"):
             helper.bounded_rpc_call(broken, 1)
 
+    def _stalled_worker_survives(self, sig, install_handlers):
+        import signal
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "worker.pid"
+            code = f"""
+import importlib.util, os, time
+spec = importlib.util.spec_from_file_location("h", {str(ROOT / "helper.py")!r})
+h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
+{"h.install_termination_handlers()" if install_handlers else ""}
+def stall():
+    open({str(pidfile)!r}, "w").write(str(os.getpid()))
+    time.sleep(60)
+h.bounded_rpc_call(stall, 30)
+"""
+            parent = subprocess.Popen([sys.executable, "-c", code], cwd=ROOT)
+            try:
+                deadline = time.monotonic() + 5
+                while not pidfile.exists() or not pidfile.read_text():
+                    self.assertLess(time.monotonic(), deadline, "worker never started")
+                    time.sleep(0.02)
+                worker = int(pidfile.read_text())
+                parent.send_signal(sig)
+                parent.wait(timeout=5)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(worker, 0)
+                    except ProcessLookupError:
+                        return False
+                    # A zombie still answers kill(0); treat it as gone.
+                    try:
+                        state = Path(f"/proc/{worker}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                    except OSError:
+                        return False
+                    if state == "Z":
+                        return False
+                    time.sleep(0.05)
+                os.kill(worker, signal.SIGKILL)
+                return True
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+
+    def test_rpc_worker_reaped_when_parent_sigterm(self):
+        import signal
+
+        self.assertFalse(self._stalled_worker_survives(signal.SIGTERM, True))
+
+    def test_rpc_worker_reaped_when_parent_sigkill(self):
+        import signal
+
+        self.assertFalse(self._stalled_worker_survives(signal.SIGKILL, False))
+
+    def test_sync_repos_respects_overall_deadline(self):
+        import time
+
+        class Hung:
+            def sync(self, _repo_id, _password):
+                time.sleep(60)
+
+        repos = [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}, {"id": "c", "name": "C"}]
+        start = time.monotonic()
+        synced, errors = helper._sync_repos(Hung(), repos, start + 1.0)
+        elapsed = time.monotonic() - start
+        self.assertEqual(synced, 0)
+        self.assertEqual(len(errors), 3)
+        self.assertLess(elapsed, 2.5)
+        self.assertTrue(helper._errors_look_transient(errors))
+
+    def test_sync_now_budget_fits_ui_watchdog(self):
+        # Service.qml helperWatchdog allows 45s for control helpers.
+        self.assertLess(helper.SYNC_NOW_BUDGET, 45.0)
+
     def test_status_keeps_cached_settings_when_live_rpc_hangs(self):
         import time
 
